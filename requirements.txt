@@ -1,0 +1,13 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Detection & Tracking
+rfdetr[plus]
+# CRITICAL: supervision 0.31 removed ByteTrack; pin >=0.25,<0.31
+supervision>=0.25,<0.31
+
+# Computer Vision & Image Processing
+opencv-python>=4.8.0
+numpy>=1.23.0,<2.0.0
+pillow>=9.0.0

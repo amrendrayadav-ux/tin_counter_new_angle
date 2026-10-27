@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output and Forensic run artifacts
+output/
+runs/
+*.mp4
+*.avi
+*.mkv
+*.mov
+temp_*
+/content/
+
+# Log files and telemetry from runs
+production_logs/*.csv
+!production_logs/.gitkeep
+*_video.mp4
+*_summary.csv
+*_per_frame_details.csv
+*_count_events.csv
+*_telemetry_dump.json
+*_trajectory_map.jpg
+
+# Environments & IDEs
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
