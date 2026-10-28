@@ -110,6 +110,23 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 DEFAULT_COUNT_LOG = os.path.join(SCRIPT_DIR, "production_logs", "counts_log.csv")
 DEFAULT_TIMING_LOG = os.path.join(SCRIPT_DIR, "production_logs", "pipeline_timing.csv")
+DEFAULT_RTSP_URL = "rtsp://admin:P%40ssw0rd@192.168.100.6:554/cam/realmonitor?channel=5&subtype=0"
+
+
+def sanitize_source_label(src):
+    """Sanitize RTSP URL by redacting passwords so they are never leaked in logs or console."""
+    src_str = str(src)
+    if src_str.lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            p = urlsplit(src_str)
+            netloc = p.hostname or "stream"
+            if p.port:
+                netloc = f"{netloc}:{p.port}"
+            return urlunsplit((p.scheme, netloc, p.path, p.query, ""))
+        except Exception:
+            return "rtsp_stream"
+    return os.path.basename(src_str)
 
 # ================================================================
 # 3. ONE-EURO SMOOTHER
@@ -801,7 +818,7 @@ def process_stream(
 
     load_dependencies()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    safe_source = os.path.basename(str(source)) if not str(source).startswith(("rtsp://", "rtsps://")) else "rtsp_stream"
+    safe_source = sanitize_source_label(source)
 
     # Git LFS pointer validation
     for name, path in [("ResNet Classifier", model_path), ("RF-DETR Detector", detector_checkpoint_path)]:
@@ -1342,8 +1359,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="24/7 RF-DETR + ResNet CCTV Counter - Real-time zero-backlog with IST & Telemetry Logging"
     )
-    parser.add_argument("--source", "-s", default=os.environ.get("SOURCE") or os.environ.get("RTSP_URL"),
-                        help="RTSP stream URL (e.g. rtsp://user:pass@ip:554/ch1), webcam index (0), or video file")
+    parser.add_argument("--source", "-s", default=os.environ.get("SOURCE") or os.environ.get("RTSP_URL") or DEFAULT_RTSP_URL,
+                        help=f"RTSP stream URL, webcam index (0), or video file (default: {sanitize_source_label(DEFAULT_RTSP_URL)})")
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH"),
                         help="ResNet152 classifier weights (defaults to models/ResNet152_direction_best_4.pth)")
     parser.add_argument("--detector-checkpoint", default=os.environ.get("DETECTOR_CHECKPOINT"),
@@ -1391,21 +1408,7 @@ def main():
         desc="class mapping",
     )
 
-    source = args.source
-    if not source:
-        # Check standard Colab test video fallback if on Colab
-        colab_video = "/content/drive/MyDrive/Amrendra_Guardex/tin_counter_new_angle/testing_video_folder/Monday_12-Oct-2026_11-09-41_AM.mp4"
-        if os.path.exists(colab_video):
-            source = colab_video
-        else:
-            raise ValueError(
-                "Missing source stream or video.\n"
-                "Provide --source <url_or_path> or set RTSP_URL or SOURCE environment variable.\n"
-                "Examples:\n"
-                "  RTSP stream : python main.py --source rtsp://user:pass@192.168.1.50:554/stream1\n"
-                "  Webcam      : python main.py --source 0\n"
-                "  Local video : python main.py --source sample.mp4"
-            )
+    source = args.source or os.environ.get("SOURCE") or os.environ.get("RTSP_URL") or DEFAULT_RTSP_URL
 
     process_stream(
         source=source,
