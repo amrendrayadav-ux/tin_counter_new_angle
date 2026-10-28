@@ -155,32 +155,26 @@ pip install -r requirements.txt
 
 ## 🚀 Quick Start
 
-The script automatically detects and resolves default paths to `./models/` if CLI arguments are omitted!
+The script automatically detects and resolves default paths to `./models/` if CLI arguments are omitted.
 
-### 1. Run on Local Video
-
-```bash
-python main.py \
-  --source "path/to/factory_recording.mp4" \
-  --output-dir "./output" \
-  --prefix "forensic_run_1"
-```
-
-### 2. Run on Live RTSP Stream
+### 1. Run on Live RTSP Stream (24/7 Production Mode)
 
 ```bash
 python main.py \
   --source "rtsp://admin:password@192.168.1.100:554/stream1" \
-  --output-dir "./output_rtsp" \
-  --prefix "live_cam_1" \
   --transport tcp \
-  --show
+  --fps 10.0
 ```
-*Press `q` in the OpenCV window to exit gracefully.*
 
-### 3. Run on Google Colab
+### 2. Run on Local Video or Webcam
 
-Open [`colab_quickstart.ipynb`](colab_quickstart.ipynb) directly in Google Colab, select a **T4 GPU** runtime, and run the cells.
+```bash
+# Webcam 0:
+python main.py --source 0
+
+# Local Video file:
+python main.py --source "path/to/factory_recording.mp4"
+```
 
 ---
 
@@ -188,56 +182,68 @@ Open [`colab_quickstart.ipynb`](colab_quickstart.ipynb) directly in Google Colab
 
 | Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--source`, `-s` | `str` | *Interactive Prompt* | Input video file path or RTSP stream URL (`rtsp://...`) |
-| `--output-dir`, `-o` | `str` | `./output` | Destination folder for forensic video, CSVs, and telemetry |
-| `--prefix` | `str` | `forensic_run_cam3` | Prefix attached to all output files |
-| `--model` | `str` | `./models/ResNet152_direction_best_4.pth` | Path to ResNet152 classifier weights |
-| `--detector-checkpoint` | `str` | `./models/best_model.pth` | Path to fine-tuned RF-DETR Small checkpoint |
-| `--mapping` | `str` | `./models/classifier_mapping.txt` | Path to class mapping file (`0:empty`, `1:full`) |
-| `--person-class-id` | `int` | `0` | Target class index in fine-tuned RF-DETR (default `0`) |
-| `--det-conf` | `float` | `0.20` | Detection confidence cutoff before tracker filtering |
+| `--source`, `-s` | `str` | *Environment / Arg* | RTSP camera stream URL (`rtsp://...`), webcam index (`0`), or video file |
+| `--log-file` | `str` | `production_logs/counts_log.csv` | Append-only CSV ledger of increasing counts in IST Day and Time |
+| `--timing-log` | `str` | `production_logs/pipeline_timing.csv` | Per-frame pipeline execution timing CSV (model, classifier, pipeline ms) |
+| `--no-timing-log` | `flag` | `False` | Disables writing the per-frame timing log |
+| `--fps` | `float` | `10.0` | Target processing FPS rate limiter pacing |
+| `--timezone` | `str` | `Asia/Kolkata` | Timezone for timestamps (IST) |
+| `--model` | `str` | `models/ResNet152_direction_best_4.pth` | Path to ResNet152 classifier weights |
+| `--detector-checkpoint` | `str` | `models/best_model.pth` | Path to fine-tuned RF-DETR Small checkpoint |
+| `--mapping` | `str` | `models/class_mapping.txt` | Path to class mapping file (`0:empty`, `1:full`) |
+| `--det-conf` | `float` | `0.20` | RF-DETR detection confidence floor |
 | `--track-thresh` | `float` | `0.40` | ByteTrack track activation threshold |
-| `--smooth-cutoff` | `float` | `0.6` | One-Euro filter cutoff (lower = heavier smoothing when still) |
-| `--smooth-beta` | `float` | `0.01` | One-Euro responsiveness (higher = lower lag when fast) |
-| `--hyst` | `float` | `12.0` | Line crossing hysteresis dead-band in pixels |
-| `--anchor` | `str` | `center` | Tracking anchor position: `center` or `bottom` |
-| `--no-stitch` | `flag` | `False` | Disables conservative ID stitching on brief tracker drops |
-| `--show` | `flag` | `False` | Displays real-time OpenCV rendering window |
 | `--transport` | `str` | `tcp` | RTSP network transport protocol (`tcp` or `udp`) |
-| `--duration` | `str` | `None` | Max duration for RTSP stream (e.g. `05:00` or `300`) |
-| `--start` | `str` | `None` | Video start timestamp (e.g. `01:30` or seconds) |
-| `--end` | `str` | `None` | Video end timestamp (e.g. `10:00` or seconds) |
+| `--reconnect-delay` | `float` | `2.0` | RTSP reconnect backoff delay in seconds |
+| `--max-retries` | `int` | `0` | Max reconnection retries (`0` for infinite 24/7 auto-retry) |
+| `--realtime` | `flag` | `False` | Forces real-time frame drop and rate limiter on video files |
+| `--show` | `flag` | `False` | Displays real-time OpenCV window (optional preview) |
 
 ---
 
-## 📊 Forensic Outputs & Telemetry
+## 📊 Telemetry & Production Logs
 
-Every run produces an audit-ready forensic bundle:
+The counter operates in a silent, high-performance mode: **all video encoding, trajectory maps, and terminal spam are removed**. The pipeline produces only two durable logs:
 
-1. **Annotated Video (`<prefix>_video.mp4`)**:
-   - Rendered with smoothed bounding boxes, track IDs, motion trajectories, crossing lines with hysteresis zones, and live telemetry HUD.
-2. **Summary CSV (`<prefix>_summary.csv`)**:
-   - Rollup of every track: `Track_ID`, `Start_Frame`, `End_Frame`, `Final_Class`, `Counted_Value` (0 or 2), `Reason`, `ID_Chain`.
-3. **Per-Frame Details CSV (`<prefix>_per_frame_details.csv`)**:
-   - Complete record of raw vs. smoothed coordinates, confidence, bounding boxes, ResNet raw prediction, and lock status for each frame.
-4. **Count Events CSV (`<prefix>_count_events.csv`)**:
-   - Chronological ledger detailing the exact frame and geometric conditions under which every count increment occurred.
-5. **Telemetry Dump JSON (`<prefix>_telemetry_dump.json`)**:
-   - Complete machine-readable JSON containing full trajectories and run metadata.
-6. **Trajectory Map (`<prefix>_trajectory_map.jpg`)**:
-   - Bird's-eye composite visualization overlaying all trajectories onto the background frame.
+### 1. Pure Increasing Count Log (`production_logs/counts_log.csv`)
+Records an append-only row strictly when a worker crosses with a positive load:
+- **`ist_day`**: Day of week (e.g. `Wednesday`)
+- **`ist_time`**: Timestamp in IST (e.g. `06:45:12.345`)
+- **`ist_date`**: Date in IST (e.g. `2026-10-28`)
+- **`ist_datetime`**: Combined IST timestamp
+- **`count_increment`**: Count delta added (`+2`)
+- **`line`**: `left` or `right` line
+- **`class_name`**: `full`
+- **`cumulative_total`**, **`cumulative_left`**, **`cumulative_right`**: Persistent running totals
+- **`track_id`**, **`count_id`**, **`frame_number`**, **`source`**
+
+**Console Output:**
+```text
+[Wednesday, 2026-10-28 06:45:12 IST] COUNT INCREASED: +2 | Total=42 (Left=22, Right=20) | Line=LEFT | Class=full
+```
+
+### 2. Per-Frame Execution Timing Log (`production_logs/pipeline_timing.csv`)
+Logs latency telemetry for every single processed frame:
+- **`ist_day`**: Day of the week in IST
+- **`ist_time`**: IST Timestamp
+- **`frame_number`**: Frame sequence number
+- **`model_time_ms`**: Time taken by RF-DETR Small object detector (ms)
+- **`classifier_time_ms`**: Time taken by ResNet152 crop classifier (ms, `0.00` if no crops)
+- **`pipeline_time_ms`**: Total end-to-end execution time for the frame (ms)
+- **`pipeline_fps`**: Instantaneous processing FPS (`1000 / pipeline_time_ms`)
+- **`num_detections`**: Number of detections in frame
+- **`num_crops_classified`**: Number of tin crops classified in frame
 
 ---
 
-## 🔬 Core Engineering Fixes & Innovations
+## 🔬 Core Engineering Innovations
 
-1. **RGB Color Alignment**: Fixed RGB vs. BGR frame formatting for RF-DETR Transformer inputs.
-2. **One-Euro Adaptive Filtering**: Eliminated jitter on stationary workers without introducing tracking lag during rapid motion.
-3. **Hysteresis Crossing Gate**: Eliminated boundary oscillation and double counts using dead-band buffers on slanted lines.
-4. **Geometry-Based Crossing (Inside $\to$ Outside)**: Computes dot-product direction from an inside work-area reference, avoiding failures of naive horizontal $dx$ gating on slanted boundaries.
-5. **Batch ResNet Inference**: Crops from all active tracks in a frame are batched together for GPU acceleration.
-6. **Conservative ID Stitching**: Prevents count duplication when a tracker briefly drops and assigns a new ID within spatial proximity.
-7. **Threaded Low-Latency RTSP Capture**: Background thread continuously flushes stale frames, ensuring real-time inference on slow hardware without buffering lag.
+1. **24/7 RTSP Real-Time Frame-Drop**: The capture thread retains only the newest frame and drops older frames during inference, keeping latency strictly at 0 ms with infinite reconnection recovery.
+2. **Kinematic Loitering Gate**: Loitering workers (`wz_empty_votes >= 10`) must achieve active motion ($\ge 120\text{ px}$ displacement) and $\ge 95\%$ mean confidence across 4 votes to lock, eliminating stationary false positives.
+3. **Stale Lock Expiration**: Mid-room occlusion locks expire if uncrossed within 35 frames.
+4. **Shifted Physical Right Exit Line**: Shifted $73\text{ px}$ outward (`RIGHT_COMMIT_PX = 85`) to clear the top-center exit doorway.
+5. **Confirmed Return Buffer**: Requires workers to re-enter $\ge 150\text{ px}$ inside the work zone for $0.8\text{ s}$ before arming a new counting cycle.
+6. **Cumulative Restoration**: Automatically restores previous session totals on reboot.
 
 ---
 

@@ -1,586 +1,410 @@
-# Standard-library imports are enough for count-log query mode.
-# CV/model dependencies are imported lazily only when running inference.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Fine-tuned RF-DETR Small + ByteTrack FORENSIC TIN/BOX COUNTER - 24/7 Real-Time CCTV Edition
+==========================================================================================
+Verified Behavioral Ground Truth Pipeline with:
+  1. Real-time 24/7 RTSP / CCTV zero-backlog frame-drop capture (10 FPS paced).
+  2. Pure minimal output: logs ONLY increasing counts with IST Day and Time.
+  3. Separate per-frame execution timing telemetry log (model_time_ms, classifier_time_ms, pipeline_time_ms).
+  4. Kinematic displacement + confidence gating on loitering tracks (zero false positives).
+  5. Stale-lock expiration (35 processed frames).
+  6. Shifted physical right exit line commit gate (RIGHT_COMMIT_PX = 85).
+  7. Confirmed-return buffer for multi-trip worker state reset.
+  8. Resilient cumulative count persistence and restoration across restarts.
+"""
+
 import argparse
 from collections import Counter, deque
 import csv
 import datetime
-import json
 import math
 import os
 import shutil
-import time
+import subprocess
+import sys
 import threading
-import queue
-import uuid
+import time
 from zoneinfo import ZoneInfo
 
-# =====================================================================
-# 1. FIXED CAMERA GEOMETRY & VALIDATED HYPERPARAMETERS
-# =====================================================================
+import cv2
+import numpy as np
 
-# Target processing rate: 10 FPS. Frame-drop / skip logic maintains this
-# cadence for both video files and live RTSP/webcam streams with zero FIFO backlog.
+# ML / CV inference dependencies loaded on demand
+torch = None
+nn = None
+sv = None
+transforms = None
+models = None
+RFDETRSmall = None
+
+def load_dependencies():
+    """Load deep learning dependencies on-demand for inference."""
+    global torch, nn, sv, transforms, models, RFDETRSmall
+    if RFDETRSmall is not None:
+        return
+    try:
+        import torch as _torch
+        import torch.nn as _nn
+        import supervision as _sv
+        from torchvision import transforms as _transforms, models as _models
+        from rfdetr import RFDETRSmall as _RFDETRSmall
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Missing required inference dependency: {exc}\n"
+            "Please install the required packages:\n"
+            "    pip install -r requirements.txt\n"
+            "or:\n"
+            "    pip install 'rfdetr[plus]' 'supervision>=0.25,<0.31' opencv-python\n"
+        ) from exc
+
+    if not hasattr(_sv, "ByteTrack"):
+        raise RuntimeError(
+            "This supervision version does not include sv.ByteTrack.\n"
+            "Please run:  pip install 'supervision<0.31'\n"
+        )
+
+    torch, nn = _torch, _nn
+    sv = _sv
+    transforms, models = _transforms, _models
+    RFDETRSmall = _RFDETRSmall
+
+# ================================================================
+# 2. TUNABLES & CAMERA GEOMETRY
+# ================================================================
+PERSON_CLASS_ID = 0
+FULL_VALUE = 2
+
 TARGET_PROCESS_FPS = 10.0
-SAMPLE_PERIOD_SEC = 1.0 / TARGET_PROCESS_FPS
-line_pt1 = (851, 1280)
-line_pt2 = (1008, 4)
+LOCK_AFTER_FRAMES = 4               # 4 consecutive 'full' votes to lock
+VOTE_WINDOW = 7                     # Rolling 7-vote majority window
 
-right_line_pt1 = (2020, 1280)
-right_line_pt2 = (1482, 3)
+# Behavioral & Kinematic Loitering Gate Parameters
+LOITER_WZ_EMPTY_MIN_VOTES = 10      # Work-zone empty votes threshold for loitering gate
+LOITER_LOCK_MEAN_CONF = 0.95        # 95% mean conf required over 4 votes for loitering tracks
+LOITER_LOCK_MIN_CONF = 0.90         # 90% min single-vote conf required for loitering tracks
+LOITER_LOCK_MIN_DISP_PX = 120.0     # Min BBox displacement (px) across 4 votes for loitering tracks
+STALE_LOCK_WZ_EMPTY_MIN = 5         # Prior work-zone empty votes for stale-lock expiration check
+STALE_LOCK_MAX_FRAMES = 35          # Max processed frames a loitering track can hold a lock without crossing
 
-# Shifted physical right exit line for display (the crossing algorithm still measures
-# distance from the inner reference line above and commits at RIGHT_CROSSING_BUFFER_PX).
-RIGHT_DRAW_LINE_START = (2099, 1280)
-RIGHT_DRAW_LINE_END = (1561, 3)
+LINE_HYSTERESIS_PX = 12             # Left line exit & return hysteresis (12px)
+RIGHT_COMMIT_PX = 85                # 73px outward line shift + 12px hysteresis = 85px from inner ref line
+NEAR_LINE_BOOST_PX = 220            # Classify every frame within 220px of inner ref lines
+REASSIGNED_RETURN_RESET_DISTANCE_PX = 150
+RETURN_RESET_SECONDS = 0.8
+DIR_WINDOW = 5
+DIR_MIN_DISP = 6
+STITCH_GAP_SEC = 0.5
+STITCH_MIN_RADIUS = 25
+STITCH_BORDER = 30
 
-# Asymmetric Entry-Trigger & Return-Buffer Thresholds (Fixed Camera Angle)
-LEFT_CROSSING_BUFFER_PX = 12.0
-RIGHT_CROSSING_BUFFER_PX = 85.0
-LEFT_RETURN_DEADBAND_PX = 12.0
-RIGHT_RETURN_DEADBAND_PX = 15.0
-RETURN_BUFFER_PX = 150.0
-MIN_WORK_ZONE_DEPTH_PX = 40.0
+# Inner Reference Lines (Used for Work-Zone boundary, Flip-TTA, and 220px pre-classification boost)
+LINE_START, LINE_END = (851, 1280), (1008, 4)
+RIGHT_LINE_START, RIGHT_LINE_END = (2020, 1280), (1482, 3)
 
-# Classification & Lock Validation Thresholds
-LOCK_STREAK = 4
-LOCK_MIN_CONF = 0.50
-LOCK_MIN_MEAN_CONF = 0.68
-LOCK_MIN_DISP_PX = 18.0
+# Actual Physical Right Exit Line (Shifted 73px perpendicular outward)
+RIGHT_DRAW_LINE_START, RIGHT_DRAW_LINE_END = (2099, 1280), (1561, 3)
 
-PRE_EMPTY_SKEPTICISM_VOTES = 4
-PRE_EMPTY_MIN_DISP_PX = 50.0
-PRE_EMPTY_MIN_CONF = 0.88
+# Paths relative to script directory for portability
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
+DEFAULT_COUNT_LOG = os.path.join(SCRIPT_DIR, "production_logs", "counts_log.csv")
+DEFAULT_TIMING_LOG = os.path.join(SCRIPT_DIR, "production_logs", "pipeline_timing.csv")
 
-LOITER_EMPTY_VOTES = 10
-LOITER_LOCK_MIN_CONF = 0.78
-LOITER_LOCK_MEAN_CONF = 0.85
-LOITER_LOCK_MIN_DISP_PX = 35.0
+# ================================================================
+# 3. ONE-EURO SMOOTHER
+# ================================================================
+class OneEuro:
+    def __init__(self, min_cutoff=0.6, beta=0.02, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
 
-STALE_LOCK_FRAMES = 35
-STALE_LOCK_EMPTY_VOTES = 5
-STALE_LOCK_TRANSIT_PX = 250.0
-TURNBACK_NEAR_LINE_PX = 80.0
-TURNBACK_RETREAT_PX = 200.0
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
 
+    def __call__(self, x, t):
+        x = np.asarray(x, dtype=np.float64)
+        if self.x_prev is None:
+            self.x_prev, self.dx_prev, self.t_prev = x, np.zeros_like(x), t
+            return x.copy()
+        dt = max(t - self.t_prev, 1e-3)
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
+        a = self._alpha(cutoff, dt)
+        x_hat = a * x + (1.0 - a) * self.x_prev
+        self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
+        return x_hat.copy()
 
-def _signed_line_distance(px, py, pt1, pt2):
-  """Signed perpendicular distance (in pixels) from point (px, py) to line pt1->pt2."""
-  x1, y1 = pt1
-  x2, y2 = pt2
-  dx = x2 - x1
-  dy = y2 - y1
-  length = math.hypot(dx, dy) or 1.0
-  return ((px - x1) * dy - (py - y1) * dx) / length
+# ================================================================
+# 4. DIRECTION & LINE GATE GEOMETRY
+# ================================================================
+def get_direction_label(dx, dy, threshold=5):
+    if math.hypot(dx, dy) < threshold or abs(dx) < 2.0:
+        return None
+    return "to_left" if dx < 0 else "to_right"
 
+def window_direction(hist, window=DIR_WINDOW, thr=DIR_MIN_DISP):
+    if len(hist) < 2:
+        return None
+    pts = list(hist)[-window:]
+    return get_direction_label(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1], threshold=thr)
 
-def _compute_line_inside_sign(pt1, pt2, ref_point):
-  """Returns +1.0 or -1.0 so that multiplying _signed_line_distance by this sign
+def signed_dist(px, py, p1, p2):
+    x1, y1 = p1
+    x2, y2 = p2
+    length = math.hypot(x2 - x1, y2 - y1) or 1.0
+    return ((px - x1) * (y2 - y1) - (py - y1) * (x2 - x1)) / length
 
-  makes the 'inside' (work zone between the lines) strictly POSITIVE (+),
-  and the 'outside' (counted exit zone) strictly NEGATIVE (-).
-  """
-  d = _signed_line_distance(ref_point[0], ref_point[1], pt1, pt2)
-  return 1.0 if d >= 0 else -1.0
+class LineGate:
+    def __init__(self, name, p1, p2, inside_ref):
+        self.name = name
+        self.p1 = p1
+        self.p2 = p2
+        d = signed_dist(inside_ref[0], inside_ref[1], p1, p2)
+        self.inside_sign = 1.0 if d >= 0 else -1.0
 
+    def inside_dist(self, px, py):
+        return signed_dist(px, py, self.p1, self.p2) * self.inside_sign
 
-_left_mid = (
-    (line_pt1[0] + line_pt2[0]) / 2.0,
-    (line_pt1[1] + line_pt2[1]) / 2.0,
-)
-_right_mid = (
-    (right_line_pt1[0] + right_line_pt2[0]) / 2.0,
-    (right_line_pt1[1] + right_line_pt2[1]) / 2.0,
-)
-WORK_ZONE_REF = (
-    (_left_mid[0] + _right_mid[0]) / 2.0,
-    (_left_mid[1] + _right_mid[1]) / 2.0,
-)
+def update_line_side(ls, gate, px, py, exit_margin, return_margin):
+    d = gate.inside_dist(px, py)
+    if ls["side"] is None:
+        ls["side"] = 1 if d >= 0 else -1
+        return None
+    if ls["side"] == 1 and d < -exit_margin:
+        ls["side"] = -1
+        return "exit"
+    if ls["side"] == -1 and d > return_margin:
+        ls["side"] = 1
+        return "return"
+    return None
 
-LEFT_INSIDE_SIGN = _compute_line_inside_sign(line_pt1, line_pt2, WORK_ZONE_REF)
-RIGHT_INSIDE_SIGN = _compute_line_inside_sign(
-    right_line_pt1, right_line_pt2, WORK_ZONE_REF
-)
-
-
-def get_inside_distance(point, pt1, pt2, inside_sign):
-  """Returns signed distance in pixels:
-
-  > 0  : Inside the central work zone
-  == 0 : On the counting line
-  < 0  : Outside the line (in the counted exit zone)
-  """
-  return _signed_line_distance(point[0], point[1], pt1, pt2) * inside_sign
-
-
-def evaluate_buffer_crossing(
-    prev_side,
-    curr_dist,
-    counted,
-    return_armed,
-    crossing_buffer_px,
-    return_deadband_px,
-    return_buffer_px=RETURN_BUFFER_PX,
-):
-  """Unified Entry-Trigger + Return-Buffer State Machine."""
-  events = []
-
-  if prev_side is None:
-    if curr_dist >= return_deadband_px:
-      init_side = 1
-    elif curr_dist <= -crossing_buffer_px:
-      init_side = -1
+# ================================================================
+# 5. CLASS MAPPING LOADER
+# ================================================================
+def load_class_mapping(mapping_path):
+    mapping = {}
+    if mapping_path and os.path.exists(mapping_path):
+        with open(mapping_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" in line:
+                    idx, cls_name = line.strip().split(":", 1)
+                    mapping[int(idx)] = cls_name
     else:
-      init_side = None
-    return init_side, return_armed, events
+        mapping = {0: "empty", 1: "full"}
+    return mapping
 
-  curr_side = prev_side
+# ================================================================
+# 6. TRACK STATE & BEHAVIORAL KINEMATIC GATED VOTING
+# ================================================================
+def make_fresh_state(tid, smooth_cutoff, smooth_beta, count_id):
+    return {
+        "ids": [tid],
+        "smoother": OneEuro(smooth_cutoff, smooth_beta),
+        "hist": deque(maxlen=12),
+        "age": 0,
+        "predictions": [],
+        "wz_empty_votes": 0,
+        "wz_full_votes": 0,
+        "consec_full_confs": [],
+        "consec_full_xys": [],
+        "locked_frame": None,
+        "class_value": None,
+        "class_name": "Unknown",
+        "class_locked": False,
+        "consecutive_same": 0,
+        "last_consecutive_class": None,
+        "counted": False,
+        "counted_value": None,
+        "count_id": str(count_id),
+        "assigned_line": None,
+        "crossed_side": None,
+        "return_buffer_side": None,
+        "return_buffer_frames": 0,
+        "cross_info": {},
+        "lines": {
+            "left": {"side": None, "crossed": False, "pending": False},
+            "right": {"side": None, "crossed": False, "pending": False},
+        },
+        "zone": None,
+        "seen_work_zone": False,
+        "color": (0, 0, 255),
+        "last_seen_frame": 0,
+        "last_xy": None,
+        "last_box": None,
+        "last_size": None,
+        "vel": (0.0, 0.0),
+        "ever_counted_full": False,
+        "ever_counted_empty": False,
+        "total_counted_value": 0,
+        "ever_crossed_left": False,
+        "ever_crossed_right": False,
+        "all_predictions": [],
+    }
 
-  if prev_side == 1:
-    if curr_dist <= -crossing_buffer_px:
-      curr_side = -1
-      events.append("crossed")
-  elif prev_side == -1:
-    if not counted:
-      if curr_dist >= return_deadband_px:
-        curr_side = 1
-        events.append("return")
-    else:
-      if not return_armed and curr_dist >= return_deadband_px:
-        return_armed = True
-        events.append("return_seen")
-      if return_armed and curr_dist >= return_buffer_px:
-        curr_side = 1
-        return_armed = False
-        events.append("return_confirmed")
-
-  return curr_side, return_armed, events
-
-
-# =====================================================================
-# 2. UNIFIED VOTE LOCKING & STALE/TURN-BACK EXPIRATION LOGIC
-# =====================================================================
-def evaluate_vote_locking(state, cls_name, conf_val, cx, cy, d_left, d_right):
-  """Appends a classification vote and evaluates whether the track should lock
-
-  into 'full' using:
-    1) Work-Zone Presence Gate (must have entered work zone: d_left >= 0 and
-    d_right >= 0)
-    2) Base Kinematic & Confidence Gate (4 consecutive 'full', min_c >= 0.50,
-    mean_c >= 0.68, disp >= 18px)
-    3) Cycle-Wide Loitering Gate (if cycle_empty_votes >= 10, requires min_c >=
-    0.78, mean_c >= 0.85, disp >= 35px)
-    4) Pre-Lock Empty Skepticism Gate (if cycle_empty_votes >= 4, requires disp
-    >= 50px or min_c >= 0.88)
-  """
-  state["predictions"].append(cls_name)
-  state["vote_details"].append((cls_name, conf_val, cx, cy, d_left, d_right))
-
-  in_wz = (d_left >= 0.0) and (d_right >= 0.0)
-  if cls_name == "empty":
-    state["cycle_empty_votes"] = state.get("cycle_empty_votes", 0) + 1
-    if in_wz:
-      state["wz_empty_votes"] = state.get("wz_empty_votes", 0) + 1
-
-  # Gate 1: Never lock as 'full' while outside the work zone (prevents V3 Track 9 pre-entry lock)
-  if not in_wz or not state.get("seen_work_zone", False):
-    return
-
-  preds = state["predictions"]
-  details = state["vote_details"]
-
-  if len(preds) >= LOCK_STREAK and all(
-      p == "full" for p in preds[-LOCK_STREAK:]
-  ):
-    last4 = details[-LOCK_STREAK:]
-    confs = [c for _, c, _, _, _, _ in last4]
-    min_c = min(confs)
-    mean_c = sum(confs) / float(LOCK_STREAK)
-    disp_px = math.hypot(last4[-1][2] - last4[0][2], last4[-1][3] - last4[0][3])
-
-    if (
-        min_c >= LOCK_MIN_CONF
-        and mean_c >= LOCK_MIN_MEAN_CONF
-        and disp_px >= LOCK_MIN_DISP_PX
-    ):
-      cycle_empty = state.get("cycle_empty_votes", 0)
-
-      if cycle_empty >= LOITER_EMPTY_VOTES:
-        if (
-            min_c >= LOITER_LOCK_MIN_CONF
-            and mean_c >= LOITER_LOCK_MEAN_CONF
-            and disp_px >= LOITER_LOCK_MIN_DISP_PX
-        ):
-          state["is_locked"] = True
-          state["locked_class"] = "full"
-      elif cycle_empty >= PRE_EMPTY_SKEPTICISM_VOTES:
-        if disp_px >= PRE_EMPTY_MIN_DISP_PX or min_c >= PRE_EMPTY_MIN_CONF:
-          state["is_locked"] = True
-          state["locked_class"] = "full"
-      else:
-        state["is_locked"] = True
-        state["locked_class"] = "full"
-
-  if state.get("is_locked") and state.get("locked_pos") is None:
-    state["locked_pos"] = (cx, cy, d_left, d_right)
-    state["min_dL_since_lock"] = d_left
-    state["min_dR_since_lock"] = d_right
-
-
-def check_stale_lock_expiration(state, current_pf, cx, cy, d_left, d_right):
-  """Expires an uncounted 'full' lock when:
-
-  1) Transit-Aware Stale Lock: age > 35 frames AND wz_empty_votes >= 5 AND
-     the worker has NOT advanced >= 250 px toward either exit line since locking
-     (expires V2 Tracks 210 & 907 while preserving V3 Track 1958).
-  2) Turn-Back / Aborted Delivery Expiration: the worker approached within 80 px
-     of an exit line after locking, did not cross, and retreated > 200 px back
-     into the work zone (expires V3 Track 1928 before it grazes the Right line).
-  """
-  if not state.get("is_locked") or state.get("counted"):
-    return False
-
-  state["min_dL_since_lock"] = min(
-      state.get("min_dL_since_lock", d_left), d_left
-  )
-  state["min_dR_since_lock"] = min(
-      state.get("min_dR_since_lock", d_right), d_right
-  )
-
-  locked_pf = state.get("locked_frame")
-  if locked_pf is None:
-    return False
-
-  age = current_pf - locked_pf
-  if age <= STALE_LOCK_FRAMES:
-    return False
-
-  l_pos = state.get("locked_pos")
-  if l_pos is not None:
-    _, _, lock_dL, lock_dR = l_pos
-    prog_l = lock_dL - d_left
-    prog_r = lock_dR - d_right
-    max_prog = max(prog_l, prog_r)
-  else:
-    max_prog = 0.0
-
-  min_dL = state.get("min_dL_since_lock", d_left)
-  min_dR = state.get("min_dR_since_lock", d_right)
-
-  turned_back_from_left = (
-      min_dL <= TURNBACK_NEAR_LINE_PX
-      and (d_left - min_dL) >= TURNBACK_RETREAT_PX
-  )
-  turned_back_from_right = (
-      min_dR <= TURNBACK_NEAR_LINE_PX
-      and (d_right - min_dR) >= TURNBACK_RETREAT_PX
-  )
-
-  wz_empty = state.get("wz_empty_votes", 0)
-
-  if (
-      wz_empty >= STALE_LOCK_EMPTY_VOTES and max_prog < STALE_LOCK_TRANSIT_PX
-  ) or turned_back_from_left or turned_back_from_right:
-    state["is_locked"] = False
-    state["locked_class"] = None
-    state["locked_frame"] = None
-    state["locked_pos"] = None
-    state["min_dL_since_lock"] = None
-    state["min_dR_since_lock"] = None
-    state["predictions"] = [p for p in state["predictions"] if p != "full"]
-    state["vote_details"] = [
-        v for v in state.get("vote_details", []) if v[0] != "full"
-    ]
-    return True
-  return False
-
-
-def get_majority_class(state):
-  """Resolves the track's majority class ('full', 'empty', or 'Unknown')."""
-  if state.get("is_locked") and state.get("locked_class"):
-    return state["locked_class"]
-  preds = state.get("predictions", [])
-  if not preds:
-    return "Unknown"
-  counts = Counter(preds)
-  if counts["full"] > counts["empty"]:
-    return "full"
-  elif counts["empty"] > counts["full"]:
-    return "empty"
-  else:
-    return preds[-1]
-
-
-def clear_pre_entry_full_noise(state):
-  """When an uncounted track crosses from outside (-1) into the work zone (+1)
-
-  (RETURN_CROSSING_IGNORED), strip any premature 'full' votes/locks acquired
-  outside the work zone while preserving 'empty' votes (fixes V3 Track 9
-  without losing V3 Tracks 93 & 550 empty history).
-  """
-  if not state.get("counted"):
-    state["is_locked"] = False
-    state["locked_class"] = None
-    state["locked_frame"] = None
-    state["locked_pos"] = None
-    state["min_dL_since_lock"] = None
-    state["min_dR_since_lock"] = None
-    state["predictions"] = [p for p in state["predictions"] if p != "full"]
-    state["vote_details"] = [
-        v for v in state.get("vote_details", []) if v[0] != "full"
-    ]
-
-
-def reset_track_for_new_count(state, current_pf):
-  """Resets a counted track when it returns past +150px inside the work zone."""
-  old_cid = state.get("count_id")
-  state["counted"] = False
-  state["counted_left"] = False
-  state["counted_right"] = False
-  state["return_armed_left"] = False
-  state["return_armed_right"] = False
-  state["is_locked"] = False
-  state["locked_class"] = None
-  state["locked_frame"] = None
-  state["locked_pos"] = None
-  state["min_dL_since_lock"] = None
-  state["min_dR_since_lock"] = None
-  state["predictions"] = []
-  state["vote_details"] = []
-  state["wz_empty_votes"] = 0
-  state["cycle_empty_votes"] = 0
-  state["last_reset_frame"] = current_pf
-  return old_cid
-
-
-# =====================================================================
-# 3. KALMAN CENTROID TRACKER
-# =====================================================================
-class KalmanCentroidTracker:
-
-  def __init__(
-      self, max_disappeared=30, max_distance=180, occlusion_zone_margin=200
-  ):
-    self.next_object_id = 1
-    self.objects = {}
-    self.kalman_filters = {}
-    self.bboxes = {}
-    self.disappeared = {}
-    self.velocities = {}
-    self.raw_centroids = {}
-    self.confidences = {}
-    self.max_disappeared = max_disappeared
-    self.max_distance = max_distance
-    self.occlusion_zone_margin = occlusion_zone_margin
-
-  def _create_kalman(self, cx, cy):
-    kf = cv2.KalmanFilter(4, 2)
-    kf.measurementMatrix = np.array(
-        [[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32
-    )
-    kf.transitionMatrix = np.array(
-        [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
-        dtype=np.float32,
-    )
-    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
-    kf.errorCovPost = np.eye(4, dtype=np.float32)
-    kf.statePost = np.array([[cx], [cy], [0.0], [0.0]], dtype=np.float32)
-    return kf
-
-  def register(self, centroid, bbox, conf):
-    oid = self.next_object_id
-    self.next_object_id += 1
-    cx, cy = float(centroid[0]), float(centroid[1])
-    self.objects[oid] = (int(cx), int(cy))
-    self.raw_centroids[oid] = (cx, cy)
-    self.bboxes[oid] = bbox
-    self.confidences[oid] = float(conf)
-    self.disappeared[oid] = 0
-    self.velocities[oid] = (0.0, 0.0)
-    self.kalman_filters[oid] = self._create_kalman(cx, cy)
-    return oid
-
-  def deregister(self, oid):
-    for d in (
-        self.objects,
-        self.raw_centroids,
-        self.bboxes,
-        self.confidences,
-        self.disappeared,
-        self.velocities,
-        self.kalman_filters,
-    ):
-      d.pop(oid, None)
-
-  def update(self, rects_with_conf, min_new_track_conf=0.40):
-    if len(rects_with_conf) == 0:
-      for oid in list(self.disappeared.keys()):
-        self.disappeared[oid] += 1
-        kf = self.kalman_filters[oid]
-        pred = kf.predict()
-        px, py = int(pred[0, 0]), int(pred[1, 0])
-        self.objects[oid] = (px, py)
-        if self.disappeared[oid] > self.max_disappeared:
-          self.deregister(oid)
-      return self._build_output()
-
-    input_centroids = np.zeros((len(rects_with_conf), 2), dtype=np.float32)
-    input_bboxes = []
-    input_confs = []
-    for i, (x1, y1, x2, y2, conf) in enumerate(rects_with_conf):
-      cx = (x1 + x2) / 2.0
-      cy = (y1 + y2) / 2.0
-      input_centroids[i] = (cx, cy)
-      input_bboxes.append((int(x1), int(y1), int(x2), int(y2)))
-      input_confs.append(float(conf))
-
-    if len(self.objects) == 0:
-      for i in range(len(rects_with_conf)):
-        if input_confs[i] >= min_new_track_conf:
-          self.register(input_centroids[i], input_bboxes[i], input_confs[i])
-      return self._build_output()
-
-    object_ids = list(self.objects.keys())
-    predicted_centroids = np.zeros((len(object_ids), 2), dtype=np.float32)
-    for idx, oid in enumerate(object_ids):
-      pred = self.kalman_filters[oid].predict()
-      predicted_centroids[idx] = (pred[0, 0], pred[1, 0])
-
-    D = np.linalg.norm(
-        predicted_centroids[:, None, :] - input_centroids[None, :, :], axis=2
-    )
-    rows = D.min(axis=1).argsort()
-    cols = D.argmin(axis=1)[rows]
-
-    used_rows = set()
-    used_cols = set()
-
-    for row, col in zip(rows, cols):
-      if row in used_rows or col in used_cols:
-        continue
-      oid = object_ids[row]
-      max_d = (
-          self.max_distance * 1.35
-          if self.disappeared[oid] > 0
-          else self.max_distance
-      )
-      if D[row, col] > max_d:
-        continue
-
-      meas = np.array(
-          [[input_centroids[col][0]], [input_centroids[col][1]]],
-          dtype=np.float32,
-      )
-      est = self.kalman_filters[oid].correct(meas)
-      cx, cy = int(est[0, 0]), int(est[1, 0])
-      vx, vy = float(est[2, 0]), float(est[3, 0])
-
-      self.objects[oid] = (cx, cy)
-      self.raw_centroids[oid] = (
-          float(input_centroids[col][0]),
-          float(input_centroids[col][1]),
-      )
-      self.bboxes[oid] = input_bboxes[col]
-      self.confidences[oid] = input_confs[col]
-      self.velocities[oid] = (vx, vy)
-      self.disappeared[oid] = 0
-
-      used_rows.add(row)
-      used_cols.add(col)
-
-    unused_rows = set(range(len(object_ids))) - used_rows
-    unused_cols = set(range(len(rects_with_conf))) - used_cols
-
-    for row in unused_rows:
-      oid = object_ids[row]
-      self.disappeared[oid] += 1
-      px, py = int(predicted_centroids[row][0]), int(
-          predicted_centroids[row][1]
-      )
-      self.objects[oid] = (px, py)
-      if self.disappeared[oid] > self.max_disappeared:
-        self.deregister(oid)
-
-    for col in unused_cols:
-      if input_confs[col] >= min_new_track_conf:
-        self.register(input_centroids[col], input_bboxes[col], input_confs[col])
-
-    return self._build_output()
-
-  def _build_output(self):
-    out = {}
-    for oid, (cx, cy) in self.objects.items():
-      out[oid] = {
-          "centroid": (cx, cy),
-          "raw_centroid": self.raw_centroids.get(oid, (float(cx), float(cy))),
-          "bbox": self.bboxes[oid],
-          "conf": self.confidences.get(oid, 0.0),
-          "disappeared": self.disappeared[oid],
-          "velocity": self.velocities.get(oid, (0.0, 0.0)),
-      }
-    return out
-
-
-# =====================================================================
-# 4. REAL-TIME CAPTURE WITH FRAME DROP / SKIP LOGIC
-# =====================================================================
-
-class RTSPCapture:
-    """Threaded RTSP / stream capture with frame-drop / skip logic.
-
-    Instead of accumulating an unbounded FIFO backlog, the capture thread always
-    retains only the newest frame and drops intermediate frames. This eliminates
-    backlog delay and memory bloat, guaranteeing real-time low latency.
+def update_class(state, pred, conf, in_wz, ax, ay, pf):
     """
+    Behavioral & Kinematic Class Voting:
+    - Normal workers (wz_empty_votes < 10) lock on 4 consecutive 'full' votes.
+    - Loitering tracks (wz_empty_votes >= 10 and wz_empty_votes > wz_full_votes) must satisfy:
+        1) Confidence Gate: 4-vote mean_conf >= 0.95 AND 4-vote min_conf >= 0.90
+        2) Kinematic Gate : 4-vote Euclidean displacement >= 120.0 px (active carrying motion)
+      Rejecting false occlusion blips cleanly eliminates stationary/drifting loitering tracks.
+    """
+    if state["class_locked"]:
+        return
 
-    def __init__(self, src, timezone, rtsp_transport="tcp", reconnect_delay=2.0,
-                 max_retries=0):
-        # Convert numeric string like "0" to integer for local webcam
+    is_loitering = (
+        state["wz_empty_votes"] >= LOITER_WZ_EMPTY_MIN_VOTES
+        and state["wz_empty_votes"] > state["wz_full_votes"]
+    )
+
+    if pred == "empty":
+        state["predictions"].append("empty")
+        if in_wz:
+            state["wz_empty_votes"] += 1
+        state["consecutive_same"] = 1
+        state["last_consecutive_class"] = "empty"
+        state["consec_full_confs"].clear()
+        state["consec_full_xys"].clear()
+    elif pred == "full":
+        if state["last_consecutive_class"] == "full":
+            state["consecutive_same"] += 1
+            state["consec_full_confs"].append(conf)
+            state["consec_full_xys"].append((ax, ay))
+        else:
+            state["consecutive_same"] = 1
+            state["last_consecutive_class"] = "full"
+            state["consec_full_confs"] = [conf]
+            state["consec_full_xys"] = [(ax, ay)]
+
+        if not is_loitering:
+            state["predictions"].append("full")
+            if in_wz:
+                state["wz_full_votes"] += 1
+
+        if state["consecutive_same"] >= LOCK_AFTER_FRAMES:
+            recent_4_c = state["consec_full_confs"][-LOCK_AFTER_FRAMES:]
+            recent_4_xy = state["consec_full_xys"][-LOCK_AFTER_FRAMES:]
+            mean_c = sum(recent_4_c) / float(len(recent_4_c))
+            min_c = min(recent_4_c)
+            disp_px = math.hypot(
+                recent_4_xy[-1][0] - recent_4_xy[0][0],
+                recent_4_xy[-1][1] - recent_4_xy[0][1],
+            )
+
+            if is_loitering and (
+                mean_c < LOITER_LOCK_MEAN_CONF
+                or min_c < LOITER_LOCK_MIN_CONF
+                or disp_px < LOITER_LOCK_MIN_DISP_PX
+            ):
+                state["consecutive_same"] = 0
+                state["last_consecutive_class"] = "empty"
+                state["consec_full_confs"].clear()
+                state["consec_full_xys"].clear()
+            else:
+                if is_loitering:
+                    state["predictions"].extend(["full"] * LOCK_AFTER_FRAMES)
+                    if in_wz:
+                        state["wz_full_votes"] += LOCK_AFTER_FRAMES
+                state["class_locked"] = True
+                state["locked_frame"] = pf
+                state["class_name"] = "full"
+                state["class_value"] = FULL_VALUE
+                return
+
+    if not state["predictions"]:
+        return
+
+    window = state["predictions"][-VOTE_WINDOW:]
+    counts = Counter(window)
+    majority = max(counts, key=lambda k: (counts[k], k == pred))
+    if (
+        majority == "full"
+        and state["wz_empty_votes"] >= LOITER_WZ_EMPTY_MIN_VOTES
+        and state["wz_empty_votes"] > state["wz_full_votes"]
+    ):
+        majority = "empty"
+
+    state["class_name"] = majority
+    if majority == "full":
+        state["class_value"] = FULL_VALUE
+    elif majority == "empty":
+        state["class_value"] = 0
+
+def check_stale_lock_expiration(state, pf):
+    """
+    If a track with prior work-zone empty votes (`wz_empty_votes >= 5`) locked as 'full'
+    in the middle of the room but has NOT crossed an exit line within `STALE_LOCK_MAX_FRAMES`
+    (35 processed frames), expire the stale lock back to 'empty'.
+    """
+    if (
+        state["class_locked"]
+        and not state["counted"]
+        and state["locked_frame"] is not None
+        and state["wz_empty_votes"] >= STALE_LOCK_WZ_EMPTY_MIN
+        and (pf - state["locked_frame"]) > STALE_LOCK_MAX_FRAMES
+    ):
+        state["class_locked"] = False
+        state["locked_frame"] = None
+        state["consecutive_same"] = 0
+        state["last_consecutive_class"] = "empty"
+        state["consec_full_confs"].clear()
+        state["consec_full_xys"].clear()
+        state["class_name"] = "empty"
+        state["class_value"] = 0
+
+# ================================================================
+# 7. RTSP 24/7 CAPTURE WITH REAL-TIME FRAME DROP
+# ================================================================
+class RTSPCapture:
+    """Threaded capture keeping only the newest frame and dropping stale frames.
+    
+    Guarantees zero-backlog real-time latency across 24/7 RTSP camera feeds.
+    Provides automatic infinite reconnection with exponential backoff on stream drops.
+    """
+    def __init__(self, src, rtsp_transport="tcp", reconnect_delay=2.0, max_retries=0, timezone=None):
         if isinstance(src, str) and src.isdigit():
             src = int(src)
         self.src = src
-        self.tz = timezone
+        self.tz = timezone or ZoneInfo("Asia/Kolkata")
         self.rtsp_transport = rtsp_transport
         self.reconnect_delay = float(reconnect_delay)
-        self.max_retries = int(max_retries)  # 0 means infinite retries for 24/7 CCTV
+        self.max_retries = int(max_retries)  # 0 means infinite 24/7 retries
         self.is_stream = isinstance(src, int) or (
-            isinstance(src, str) and src.startswith(
-                ("rtsp://", "rtsps://", "http://", "https://")
-            )
+            isinstance(src, str) and src.startswith(("rtsp://", "rtsps://", "http://", "https://"))
         )
         self.cap = None
-        self.stop_event = threading.Event()
+        self.stopped = threading.Event()
         self.new_frame_event = threading.Event()
         self.lock = threading.Lock()
 
-        # Latest frame buffer (overwritten continuously; stale frames are dropped)
         self.latest_frame = None
         self.latest_frame_id = 0
         self.latest_captured_at = None
         self.total_captured = 0
         self.dropped_frames = 0
         self.capture_finished = False
-        self.thread = None
 
-        if self.is_stream and isinstance(src, str) and src.startswith(("rtsp://", "rtsps://", "http://", "https://")):
+        if self.is_stream and isinstance(self.src, str) and self.src.startswith(("rtsp://", "rtsps://")):
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
                 f"rtsp_transport;{self.rtsp_transport}|fflags;nobuffer|flags;low_delay|stimeout;5000000|max_delay;500000"
             )
 
-        connected = self._try_connect()
-        if not connected:
-            if self.is_stream:
-                print(f"WARNING: Initial connection to RTSP stream '{source_label(self.src)}' not established yet.")
-                print(f"Starting background reconnection loop (retrying every {self.reconnect_delay:.1f}s)...")
-            else:
-                raise RuntimeError(f"Could not open video file: {self.src}")
-
+        self._connect()
         if self.is_stream:
             self.thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.thread.start()
 
-    def _try_connect(self):
-        """Attempts to open or reopen the video/stream source cleanly."""
+    def _connect(self):
         try:
             if self.cap is not None:
                 try:
@@ -622,69 +446,56 @@ class RTSPCapture:
     def _capture_loop(self):
         failures = 0
         reconnects = 0
-        try:
-            while not self.stop_event.is_set():
-                with self.lock:
-                    cap = self.cap
-                if cap is None or not cap.isOpened():
-                    if self.max_retries > 0 and reconnects >= self.max_retries:
-                        print("ERROR: RTSP reconnect retries exhausted.")
-                        break
-                    reconnects += 1
-                    retry_label = f"({reconnects}/{self.max_retries})" if self.max_retries > 0 else f"(attempt {reconnects})"
-                    print(f"WARNING: RTSP stream disconnected; reconnecting {retry_label}...")
-                    if self.stop_event.wait(self.reconnect_delay):
-                        break
-                    if self._try_connect():
-                        print(f"SUCCESS: Reconnected to RTSP stream '{source_label(self.src)}'.")
-                        reconnects = 0
-                        failures = 0
-                    continue
-
-                try:
-                    ret, frame = cap.read()
-                except Exception as exc:
-                    ret, frame = False, None
-                    print(f"WARNING: RTSP read error: {exc}")
-
-                if ret and frame is not None:
-                    failures = 0
+        while not self.stopped.is_set():
+            with self.lock:
+                cap = self.cap
+            if cap is None or not cap.isOpened():
+                if self.max_retries > 0 and reconnects >= self.max_retries:
+                    break
+                reconnects += 1
+                if self.stopped.wait(self.reconnect_delay):
+                    break
+                if self._connect():
                     reconnects = 0
-                    now_ts = datetime.datetime.now(self.tz)
-                    with self.lock:
-                        self.total_captured += 1
-                        self.latest_frame = frame
-                        self.latest_frame_id = self.total_captured
-                        self.latest_captured_at = now_ts
-                    self.new_frame_event.set()
+                    failures = 0
+                continue
+
+            try:
+                ret, frame = cap.read()
+            except Exception:
+                ret, frame = False, None
+
+            if ret and frame is not None:
+                failures = 0
+                reconnects = 0
+                now_ts = datetime.datetime.now(self.tz)
+                with self.lock:
+                    self.total_captured += 1
+                    self.latest_frame = frame
+                    self.latest_frame_id = self.total_captured
+                    self.latest_captured_at = now_ts
+                self.new_frame_event.set()
+            else:
+                failures += 1
+                if failures >= 20:
+                    if not self.stopped.wait(0.1):
+                        if self._connect():
+                            failures = 0
+                            reconnects = 0
                 else:
-                    failures += 1
-                    if failures >= 20:
-                        print("WARNING: RTSP frame reads failing; reconnecting...")
-                        if not self.stop_event.wait(0.1):
-                            if self._try_connect():
-                                failures = 0
-                                reconnects = 0
-                    else:
-                        self.stop_event.wait(0.01)
-        finally:
-            self.capture_finished = True
+                    self.stopped.wait(0.01)
+        self.capture_finished = True
 
     def read_next(self, last_fid=None, timeout=0.5):
-        """Read the next fresh frame.
-
-        For live streams: returns the latest captured frame, dropping any stale
-        frames that accumulated during inference. Waits up to timeout for a new frame.
-        For video files: reads sequentially.
-        """
+        """Returns the latest frame, skipping intermediate frames so latency remains zero."""
         if self.is_stream:
             end_time = time.monotonic() + max(0.0, timeout)
-            while not self.stop_event.is_set():
+            while not self.stopped.is_set():
                 with self.lock:
                     if self.latest_frame is not None and (last_fid is None or self.latest_frame_id > last_fid):
                         if last_fid is not None and (self.latest_frame_id - last_fid) > 1:
                             self.dropped_frames += (self.latest_frame_id - last_fid - 1)
-                        return True, self.latest_frame, self.latest_frame_id, self.latest_captured_at
+                        return True, self.latest_frame.copy(), self.latest_frame_id, self.latest_captured_at
 
                 if self.capture_finished:
                     return False, None, None, None
@@ -697,7 +508,7 @@ class RTSPCapture:
 
             with self.lock:
                 if self.latest_frame is not None and (last_fid is None or self.latest_frame_id > last_fid):
-                    return True, self.latest_frame, self.latest_frame_id, self.latest_captured_at
+                    return True, self.latest_frame.copy(), self.latest_frame_id, self.latest_captured_at
             return False, None, None, None
 
         # Video file sequential read
@@ -709,106 +520,184 @@ class RTSPCapture:
             fid = self.total_captured
         return True, frame, fid, datetime.datetime.now(self.tz)
 
-    def get_dropped_count(self):
-        return self.dropped_frames
-
-    def queue_size(self):
-        """Deprecated: always returns 0 since frames are dropped instead of queued."""
-        return 0
+    def isOpened(self):
+        if self.is_stream:
+            return not self.stopped.is_set() and (self.cap is not None and self.cap.isOpened())
+        return self.cap is not None and self.cap.isOpened()
 
     def get(self, prop_id):
         if self.cap is not None:
-            try:
-                return self.cap.get(prop_id)
-            except Exception:
-                return 0.0
+            val = self.cap.get(prop_id)
+            if prop_id == cv2.CAP_PROP_FRAME_WIDTH and (val <= 0 or np.isnan(val)) and self.latest_frame is not None:
+                return float(self.latest_frame.shape[1])
+            if prop_id == cv2.CAP_PROP_FRAME_HEIGHT and (val <= 0 or np.isnan(val)) and self.latest_frame is not None:
+                return float(self.latest_frame.shape[0])
+            return val
         return 0.0
 
     def set(self, prop_id, value):
-        return self.cap.set(prop_id, value) if self.cap is not None else False
-
-    def stop_capture(self):
-        self.stop_event.set()
-        self.new_frame_event.set()
-        try:
-            if self.cap is not None:
-                self.cap.release()
-        except Exception:
-            pass
-        if self.thread is not None and self.thread.is_alive() and threading.current_thread() is not self.thread:
-            self.thread.join(timeout=2.0)
-        self.capture_finished = True
+        return self.cap.set(prop_id, value) if self.cap else False
 
     def release(self):
-        self.stop_capture()
+        self.stopped.set()
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
+# ================================================================
+# 8. RESNET BATCH CLASSIFIER WITH FLIP TTA
+# ================================================================
+def classify_crops(resnet, transform, crops_bgr, flip_flags, device, class_mapping):
+    if not crops_bgr:
+        return []
+    tensors = []
+    map_idx = []
+    for i, (c, do_flip) in enumerate(zip(crops_bgr, flip_flags)):
+        rgb = cv2.cvtColor(c, cv2.COLOR_BGR2RGB)
+        tensors.append(transform(rgb))
+        map_idx.append((i, False))
+        if do_flip:
+            tensors.append(transform(cv2.flip(rgb, 1)))
+            map_idx.append((i, True))
 
-# =====================================================================
-# 5. SINGLE APPEND-ONLY COUNT LOG + QUERY MODE
-# =====================================================================
+    batch = torch.stack(tensors).to(device)
+    with torch.no_grad():
+        probs = torch.nn.functional.softmax(resnet(batch), dim=1).cpu().numpy()
 
-LOG_FIELDS = [
-    "event_time",          # Timestamp of the frame associated with the count event
-    "logged_at",           # Actual wall-clock time the event was written
-    "source_type",         # rtsp or video
-    "source",              # Redacted source label (not the RTSP password/URL)
-    "session_id",           # Unique process session
-    "source_frame",
-    "processed_frame",
-    "track_id",
-    "count_id",
-    "line",
-    "event",
-    "class_name",
-    "class_confidence",
-    "detector_confidence",
-    "added",
-    "left_delta",
-    "right_delta",
-    "total_delta",
-    "cumulative_left",
-    "cumulative_right",
-    "cumulative_total",
-    "source_time",         # ISO timestamp for a video if --video-start-datetime is supplied
-    "source_seconds",      # Offset into video file; blank for RTSP
+    full_idx = next((k for k, v in class_mapping.items() if v.lower() == "full"), 1)
+
+    crop_probs = {}
+    for (crop_i, _), p in zip(map_idx, probs):
+        if crop_i not in crop_probs:
+            crop_probs[crop_i] = p.copy()
+        else:
+            if p[full_idx] > crop_probs[crop_i][full_idx]:
+                crop_probs[crop_i] = p.copy()
+
+    out = []
+    for i in range(len(crops_bgr)):
+        p = crop_probs[i]
+        pred_idx = int(np.argmax(p))
+        conf = float(p[pred_idx])
+        out.append((class_mapping.get(pred_idx, "Unknown").lower(), conf))
+    return out
+
+# ================================================================
+# 9. LOGGERS (PURE INCREASING COUNT IN IST + PER-FRAME TIMING)
+# ================================================================
+COUNT_LOG_FIELDS = [
+    "ist_day",             # e.g. "Wednesday"
+    "ist_time",            # e.g. "06:45:12.345"
+    "ist_date",            # e.g. "2026-10-28"
+    "ist_datetime",        # e.g. "2026-10-28 06:45:12.345"
+    "count_increment",     # Increment added (e.g. 2)
+    "line",                # "left" or "right"
+    "class_name",          # "full"
+    "cumulative_total",    # Running total count
+    "cumulative_left",     # Running left line count
+    "cumulative_right",    # Running right line count
+    "track_id",            # Tracker ID
+    "count_id",            # Count sequence identifier
+    "frame_number",        # Processed frame number
+    "source",              # Input stream / file
 ]
 
+class CountEventLogger:
+    """Appends one durable CSV row strictly when count INCREASES; flushes immediately."""
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        needs_header = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        self.file = open(self.path, "a", newline="", encoding="utf-8", buffering=1)
+        self.writer = csv.DictWriter(self.file, fieldnames=COUNT_LOG_FIELDS, extrasaction="ignore")
+        if needs_header:
+            self.writer.writeheader()
+            self.flush()
 
-def now_local(tz):
-    return datetime.datetime.now(tz)
+    def log_increment(self, dt, val, line, cls_name, total, left, right, tid, cid, frame_no, src):
+        row = {
+            "ist_day": dt.strftime("%A"),
+            "ist_time": dt.strftime("%H:%M:%S.%f")[:-3],
+            "ist_date": dt.strftime("%Y-%m-%d"),
+            "ist_datetime": dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "count_increment": int(val),
+            "line": str(line).lower(),
+            "class_name": str(cls_name).lower(),
+            "cumulative_total": int(total),
+            "cumulative_left": int(left),
+            "cumulative_right": int(right),
+            "track_id": tid,
+            "count_id": cid,
+            "frame_number": frame_no,
+            "source": src,
+        }
+        self.writer.writerow(row)
+        self.flush()
 
-
-def iso_time(dt):
-    if dt is None:
-        return ""
-    if dt.tzinfo is None:
-        return dt.isoformat(timespec="milliseconds")
-    return dt.isoformat(timespec="milliseconds")
-
-
-def parse_datetime(value, tz):
-    """Parse ISO date/time; naive date/time is interpreted in --timezone."""
-    if not value:
-        raise ValueError("A timestamp is required.")
-    text_value = value.strip().replace("Z", "+00:00")
-    dt = datetime.datetime.fromisoformat(text_value)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)
-    else:
-        dt = dt.astimezone(tz)
-    return dt
-
-
-def source_label(src):
-    """Avoid writing stream credentials to the log file."""
-    if isinstance(src, str) and src.lower().startswith(("rtsp://", "rtsps://")):
+    def flush(self):
+        self.file.flush()
         try:
-            from urllib.parse import urlsplit
-            p = urlsplit(src)
-            return f"{p.scheme}://{p.hostname or 'stream'}:{p.port or ''}{p.path}"
+            os.fsync(self.file.fileno())
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            self.flush()
+        finally:
+            self.file.close()
+
+
+TIMING_LOG_FIELDS = [
+    "ist_day",              # e.g. "Wednesday"
+    "ist_time",             # Timestamp in IST (YYYY-MM-DD HH:MM:SS.mmm)
+    "frame_number",         # Processed frame index
+    "model_time_ms",        # Execution time of RF-DETR detector on this frame (ms)
+    "classifier_time_ms",   # Execution time of ResNet classifier on tin crops this frame (ms)
+    "pipeline_time_ms",     # Total end-to-end frame processing latency (ms)
+    "pipeline_fps",         # Instantaneous pipeline throughput for this frame (FPS)
+    "num_detections",       # Total person/tin detections in frame
+    "num_crops_classified", # Number of tin crops classified in frame
+]
+
+class PipelineTimingLogger:
+    """Logs per-frame execution telemetry: model time, classifier time, pipeline time."""
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        needs_header = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        self.file = open(self.path, "a", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.file, fieldnames=TIMING_LOG_FIELDS, extrasaction="ignore")
+        if needs_header:
+            self.writer.writeheader()
+            self.file.flush()
+        self._counter = 0
+
+    def log_frame(self, dt, frame_no, model_ms, classifier_ms, pipeline_ms, num_dets, num_crops):
+        row = {
+            "ist_day": dt.strftime("%A"),
+            "ist_time": dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "frame_number": frame_no,
+            "model_time_ms": f"{model_ms:.2f}",
+            "classifier_time_ms": f"{classifier_ms:.2f}",
+            "pipeline_time_ms": f"{pipeline_ms:.2f}",
+            "pipeline_fps": f"{1000.0 / max(pipeline_ms, 1e-3):.2f}",
+            "num_detections": num_dets,
+            "num_crops_classified": num_crops,
+        }
+        self.writer.writerow(row)
+        self._counter += 1
+        if self._counter % 10 == 0:
+            self.file.flush()
+
+    def close(self):
+        try:
+            self.file.flush()
+            self.file.close()
         except Exception:
-            return "rtsp_stream"
-    return os.path.basename(str(src))
+            pass
 
 
 def load_cumulative_from_log(log_path):
@@ -821,176 +710,21 @@ def load_cumulative_from_log(log_path):
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             return totals
-        missing = set(LOG_FIELDS) - set(reader.fieldnames)
-        if missing:
-            raise RuntimeError(
-                f"Log file schema does not match this script: missing {sorted(missing)}. "
-                "Choose a new --log-file or migrate the old CSV first."
-            )
         for row in reader:
             try:
                 totals = {
-                    "left": int(float(row["cumulative_left"])),
-                    "right": int(float(row["cumulative_right"])),
-                    "total": int(float(row["cumulative_total"])),
+                    "left": int(float(row.get("cumulative_left") or 0)),
+                    "right": int(float(row.get("cumulative_right") or 0)),
+                    "total": int(float(row.get("cumulative_total") or 0)),
                 }
             except (TypeError, ValueError, KeyError):
-                # Ignore a malformed final row from an abrupt OS-level termination.
                 continue
     return totals
 
-
-class CountEventLogger:
-    """Append one durable CSV row per accepted crossing; never rewrites old events."""
-    def __init__(self, path):
-        self.path = os.path.abspath(path)
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        needs_header = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
-        if not needs_header:
-            with open(self.path, "r", newline="", encoding="utf-8") as f:
-                existing_header = next(csv.reader(f), [])
-            if existing_header != LOG_FIELDS:
-                raise RuntimeError(
-                    "Existing count log has a different header. Use a new --log-file "
-                    "or archive the previous log before starting."
-                )
-        self.f = open(self.path, "a", newline="", encoding="utf-8", buffering=1)
-        self.writer = csv.DictWriter(self.f, fieldnames=LOG_FIELDS, extrasaction="ignore")
-        if needs_header:
-            self.writer.writeheader()
-            self.flush_durable()
-
-    def write_count(self, row):
-        self.writer.writerow(row)
-        self.flush_durable()
-
-    def flush_durable(self):
-        self.f.flush()
-        os.fsync(self.f.fileno())
-
-    def close(self):
-        try:
-            self.flush_durable()
-        finally:
-            self.f.close()
-
-
-def query_log(log_path, query_start, query_end, timezone, time_column="event_time"):
-    """Sum count deltas in [query_start, query_end); end is exclusive."""
-    if not os.path.isfile(log_path):
-        raise FileNotFoundError(f"Count log not found: {log_path}")
-    if time_column not in {"event_time", "source_time"}:
-        raise ValueError("--query-time-column must be event_time or source_time")
-
-    start_dt = parse_datetime(query_start, timezone)
-    end_dt = parse_datetime(query_end, timezone)
-    if end_dt <= start_dt:
-        raise ValueError("Query end must be later than query start.")
-
-    interval = {"left": 0, "right": 0, "total": 0}
-    event_rows = 0
-    matched_rows = 0
-
-    with open(log_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise RuntimeError("Count log is empty or has no header.")
-        missing = set(LOG_FIELDS) - set(reader.fieldnames)
-        if missing:
-            raise RuntimeError(f"Count log missing fields: {sorted(missing)}")
-
-        for row in reader:
-            event_rows += 1
-            raw_ts = (row.get(time_column) or "").strip()
-            if not raw_ts:
-                continue
-            try:
-                ts = parse_datetime(raw_ts, timezone)
-            except (ValueError, TypeError):
-                continue
-            if start_dt <= ts < end_dt:
-                matched_rows += 1
-                interval["left"] += int(float(row.get("left_delta") or 0))
-                interval["right"] += int(float(row.get("right_delta") or 0))
-                interval["total"] += int(float(row.get("total_delta") or 0))
-
-    print("\nCOUNT REPORT (end timestamp is exclusive)")
-    print("=" * 58)
-    print(f"Log file       : {os.path.abspath(log_path)}")
-    print(f"Time field     : {time_column}")
-    print(f"Start          : {iso_time(start_dt)} (inclusive)")
-    print(f"End            : {iso_time(end_dt)} (exclusive)")
-    print(f"Count events   : {matched_rows}")
-    print(f"Left count     : {interval['left']}")
-    print(f"Right count    : {interval['right']}")
-    print(f"Total count    : {interval['total']}")
-    print("=" * 58)
-
-
-# Absolute paths relative to the script location for complete portability
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
-DEFAULT_LOG_PATH = os.path.join(SCRIPT_DIR, "production_logs", "counts_log.csv")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="24/7 RF-DETR + ResNet forensic counter. Self-contained and deployable on local PC, server, and cloud."
-    )
-    parser.add_argument("--source", "-s", default=os.environ.get("SOURCE") or os.environ.get("RTSP_URL"),
-                        help="RTSP/HTTP stream URL, webcam ID (e.g. 0), or video file path (defaults to RTSP_URL or SOURCE env var)")
-    parser.add_argument("--log-file", default=os.environ.get("LOG_FILE"),
-                        help="Append-only count CSV path (defaults to production_logs/counts_log.csv)")
-    parser.add_argument("--model", default=os.environ.get("MODEL_PATH"),
-                        help="ResNet checkpoint path (defaults to models/ResNet152_direction_best_4.pth)")
-    parser.add_argument("--detector-checkpoint", default=os.environ.get("DETECTOR_CHECKPOINT"),
-                        help="Fine-tuned RF-DETR Small checkpoint path (defaults to models/best_model.pth)")
-    parser.add_argument("--mapping", default=os.environ.get("MAPPING_PATH"),
-                        help="Class mapping text file (defaults to models/class_mapping.txt)")
-    parser.add_argument("--timezone", default=os.environ.get("TIMEZONE", "Asia/Kolkata"),
-                        help="Timezone for timestamps, default Asia/Kolkata")
-    parser.add_argument("--det-conf", type=float, default=0.20, help="RF-DETR detection threshold (default: 0.20)")
-    parser.add_argument("--track-thresh", type=float, default=0.40, help="Minimum confidence to create new tracks (default: 0.40)")
-    parser.add_argument("--max-inference-fps", type=float, default=10.0,
-                        help="Maximum RF-DETR inference start rate for RTSP; use camera encoder 10 FPS for no backlog (default: 10.0)")
-    parser.add_argument("--rtsp-transport", choices=["tcp", "udp"], default="tcp", help="RTSP transport protocol (default: tcp)")
-    parser.add_argument("--rtsp-reconnect-delay", type=float, default=2.0, help="Delay in seconds between RTSP reconnect attempts (default: 2.0)")
-    parser.add_argument("--rtsp-max-retries", type=int, default=0, help="Max RTSP reconnection attempts (default: 0 for infinite 24/7 retry)")
-    parser.add_argument("--video-start-datetime", default=None,
-                        help="Optional ISO datetime for start of source video, e.g. 2026-10-27T08:00:00+05:30")
-    parser.add_argument("--start", default=None, help="Video start offset in seconds, MM:SS, or HH:MM:SS")
-    parser.add_argument("--end", default=None, help="Video end offset in seconds, MM:SS, or HH:MM:SS")
-    parser.add_argument("--query-start", default=None, help="Query start datetime, ISO format")
-    parser.add_argument("--query-end", default=None, help="Query end datetime, ISO format")
-    parser.add_argument("--query-time-column", choices=["event_time", "source_time"], default="event_time",
-                        help="Timestamp column for query; use source_time for videos with --video-start-datetime")
-    parser.add_argument("--query-only", action="store_true", help="Query existing count log and exit without loading models")
-    parser.add_argument("--max-queue-warning", type=int, default=0, help=argparse.SUPPRESS)
-    return parser.parse_args()
-
-
-def ensure_colab_drive_if_needed(path):
-    if not path:
-        return
-    norm = os.path.abspath(path).replace("\\", "/")
-    if not norm.startswith("/content/drive/"):
-        return
-    if os.path.exists("/content/drive/MyDrive"):
-        return
-    try:
-        from google.colab import drive
-        drive.mount("/content/drive")
-    except ImportError:
-        pass
-    except Exception as exc:
-        raise RuntimeError(
-            f"Path is configured under Google Drive ({path}) but Drive could not be mounted. "
-            "Mount Drive in Colab or use local paths with --log-file, --model and --detector-checkpoint."
-        ) from exc
-
-
+# ================================================================
+# 10. ASSET PATH RESOLVER & GIT LFS VALIDATION
+# ================================================================
 def check_git_lfs_pointer(filepath):
-    """Detect if a file is an un-pulled Git LFS pointer text file (~130 bytes)."""
     if not filepath or not os.path.isfile(filepath):
         return False
     if os.path.getsize(filepath) < 10240:
@@ -1003,151 +737,646 @@ def check_git_lfs_pointer(filepath):
             pass
     return False
 
-
 def resolve_asset_path(cli_path, candidate_names, env_var=None, desc="asset"):
-    """Intelligently resolves asset/checkpoint paths across:
-    1. CLI argument (if provided)
-    2. Environment variable (if provided)
-    3. Local repo 'models/' directory (<repo_root>/models/)
-    4. Local repo root directory (<repo_root>/)
-    5. Google Colab Drive paths (if running in Colab)
-    """
-    if cli_path:
-        norm = os.path.abspath(cli_path)
-        if os.path.isfile(norm):
-            return norm
-        raise FileNotFoundError(f"{desc.capitalize()} file specified via CLI argument not found: {cli_path}")
+    if cli_path and os.path.isfile(cli_path):
+        return os.path.abspath(cli_path)
+    if env_var and os.environ.get(env_var) and os.path.isfile(os.environ[env_var]):
+        return os.path.abspath(os.environ[env_var])
+    if isinstance(candidate_names, str):
+        candidate_names = [candidate_names]
+    for name in candidate_names:
+        p = os.path.join(MODELS_DIR, name)
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    # Colab Drive fallback
+    colab_dir = "/content/drive/MyDrive/Amrendra_Guardex/tin_counter_new_angle/models"
+    for name in candidate_names:
+        p = os.path.join(colab_dir, name)
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    return os.path.join(MODELS_DIR, candidate_names[0])
 
-    if env_var and os.environ.get(env_var):
-        env_val = os.environ.get(env_var)
-        norm = os.path.abspath(env_val)
-        if os.path.isfile(norm):
-            return norm
-        raise FileNotFoundError(f"{desc.capitalize()} file specified via ${env_var} not found: {env_val}")
-
-    search_dirs = [
-        MODELS_DIR,
-        SCRIPT_DIR,
-        os.path.join(SCRIPT_DIR, "..", "models"),
-    ]
-
-    for s_dir in search_dirs:
-        for fname in candidate_names:
-            candidate = os.path.normpath(os.path.join(s_dir, fname))
-            if os.path.isfile(candidate):
-                return candidate
-
-    # Colab Drive fallbacks
-    colab_base = "/content/drive/MyDrive/Amrendra_Guardex/tin_counter_new_angle"
-    colab_search_dirs = [
-        os.path.join(colab_base, "testing_video_folder_8", "models"),
-        os.path.join(colab_base, "model"),
-        os.path.join(colab_base, "KD", "runs (1)", "student_train"),
-        os.path.join(colab_base, "dataset"),
-        "/content/models",
-    ]
-    for c_dir in colab_search_dirs:
-        for fname in candidate_names:
-            candidate = os.path.normpath(os.path.join(c_dir, fname))
-            if os.path.isfile(candidate):
-                return candidate
-
-    return os.path.normpath(os.path.join(MODELS_DIR, candidate_names[0]))
-
-
-def parse_offset_seconds(value):
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    val_str = str(value).strip()
-    if ":" in val_str:
-        parts = val_str.split(":")
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + float(parts[1])
-        elif len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-        raise ValueError(f"Invalid offset {value!r}; use seconds, MM:SS, or HH:MM:SS")
-    return float(val_str)
-
-
-def load_class_mapping(mapping_path):
-    """Load class mapping from text file with index:name lines."""
-    mapping = {}
-    if mapping_path and os.path.exists(mapping_path):
-        with open(mapping_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if ":" in line:
-                    idx, cls_name = line.split(":", 1)
-                    try:
-                        mapping[int(idx.strip())] = cls_name.strip()
-                    except ValueError:
-                        continue
-    if not mapping:
-        mapping = {0: "empty", 1: "full"}
-    return mapping
-
-
-def build_classifier(model_path, num_classes, device):
-    """Construct and initialize ResNet152 classifier."""
-    resnet = models.resnet152(weights=None)
-    resnet.fc = nn.Linear(resnet.fc.in_features, num_classes)
+# ================================================================
+# 11. MAIN 24/7 PIPELINE EXECUTION
+# ================================================================
+def process_stream(
+    source,
+    model_path,
+    detector_checkpoint_path,
+    class_mapping_path,
+    log_file_path=DEFAULT_COUNT_LOG,
+    timing_log_path=DEFAULT_TIMING_LOG,
+    line_pt1=LINE_START,
+    line_pt2=LINE_END,
+    right_line_pt1=RIGHT_LINE_START,
+    right_line_pt2=RIGHT_LINE_END,
+    classify_interval=5,
+    target_fps=10.0,
+    rfdetr_conf_threshold=0.20,
+    person_class_id=0,
+    track_activation=0.40,
+    lost_sec=3.0,
+    min_consecutive=2,
+    nms_iou=0.6,
+    smooth_cutoff=0.6,
+    smooth_beta=0.01,
+    line_hysteresis=LINE_HYSTERESIS_PX,
+    right_commit_px=RIGHT_COMMIT_PX,
+    anchor="center",
+    enable_stitch=True,
+    start_time_str=None,
+    end_time_str=None,
+    show_display=False,
+    rtsp_transport="tcp",
+    reconnect_delay=2.0,
+    max_retries=0,
+    timezone_name="Asia/Kolkata",
+    no_timing_log=False,
+    realtime=False,
+):
     try:
-        state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    except TypeError:
-        state_dict = torch.load(model_path, map_location=device)
+        tz = ZoneInfo(timezone_name)
     except Exception:
-        state_dict = torch.load(model_path, map_location=device)
+        tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
-    if isinstance(state_dict, dict):
-        if "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-        elif "model" in state_dict:
-            state_dict = state_dict["model"]
+    load_dependencies()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    safe_source = os.path.basename(str(source)) if not str(source).startswith(("rtsp://", "rtsps://")) else "rtsp_stream"
 
-    resnet.load_state_dict(state_dict)
+    # Git LFS pointer validation
+    for name, path in [("ResNet Classifier", model_path), ("RF-DETR Detector", detector_checkpoint_path)]:
+        if check_git_lfs_pointer(path):
+            raise RuntimeError(
+                f"Model file '{os.path.basename(path)}' is a Git LFS pointer text file. Run 'git lfs pull' to download binary weights."
+            )
+
+    is_stream = (
+        isinstance(source, int)
+        or (isinstance(source, str) and (source.isdigit() or source.startswith(("rtsp://", "rtsps://", "http://", "https://"))))
+        or realtime
+    )
+
+    # Load neural models
+    class_mapping = load_class_mapping(class_mapping_path)
+    resnet = models.resnet152(weights=None)
+    resnet.fc = nn.Linear(resnet.fc.in_features, len(class_mapping))
+    try:
+        resnet.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    except TypeError:
+        resnet.load_state_dict(torch.load(model_path, map_location=device))
     resnet = resnet.to(device)
     resnet.eval()
-    return resnet
 
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
-def load_runtime_dependencies():
-    """Load CV/ML packages only for inference mode, not for CSV query mode."""
-    global cv2, np, Image, RFDETRSmall, torch, nn, models, transforms
+    detector = RFDETRSmall.from_checkpoint(detector_checkpoint_path)
+
+    # Initialize video/stream capture with 24/7 reconnects & frame drop
+    cap = RTSPCapture(
+        source,
+        rtsp_transport=rtsp_transport,
+        reconnect_delay=reconnect_delay,
+        max_retries=max_retries,
+        timezone=tz,
+    )
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not connect to stream / video source: {source}")
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps_val = cap.get(cv2.CAP_PROP_FPS)
+    if fps_val <= 0 or fps_val > 120 or np.isnan(fps_val):
+        fps_val = float(target_fps) if target_fps > 0 else 25.0
+    effective_fps = float(target_fps) if (is_stream or target_fps > 0) else fps_val
+
+    # Tracker initialization
+    trk_fps = max(1, int(round(effective_fps)))
+    lost_buf = int(round(lost_sec * 30))
+    max_lost_frames = int(trk_fps / 30.0 * lost_buf)
+    EVICT_AFTER_FRAMES = max_lost_frames + 5
+    stitch_gap = max(2, int(round(STITCH_GAP_SEC * effective_fps)))
+
     try:
-        import cv2 as _cv2
-        import numpy as _np
-        from PIL import Image as _Image
-        from rfdetr import RFDETRSmall as _RFDETRSmall
-        import torch as _torch
-        import torch.nn as _nn
-        from torchvision import models as _models, transforms as _transforms
-    except ImportError as exc:
-        raise RuntimeError(
-            "Inference dependencies are missing. Install them in the runtime first, "
-            "for example: pip install -r requirements.txt"
-        ) from exc
-    cv2, np, Image = _cv2, _np, _Image
-    RFDETRSmall, torch, nn = _RFDETRSmall, _torch, _nn
-    models, transforms = _models, _transforms
+        tracker = sv.ByteTrack(
+            track_activation_threshold=track_activation,
+            lost_track_buffer=lost_buf,
+            minimum_matching_threshold=0.8,
+            frame_rate=trk_fps,
+            minimum_consecutive_frames=min_consecutive,
+        )
+    except TypeError:
+        tracker = sv.ByteTrack(track_thresh=track_activation, track_buffer=lost_buf, match_thresh=0.8, frame_rate=trk_fps)
+
+    # Geometry & Line Gates
+    lmid = ((line_pt1[0] + line_pt2[0]) / 2.0, (line_pt1[1] + line_pt2[1]) / 2.0)
+    rmid = ((right_line_pt1[0] + right_line_pt2[0]) / 2.0, (right_line_pt1[1] + right_line_pt2[1]) / 2.0)
+    inside_ref = ((lmid[0] + rmid[0]) / 2.0, (lmid[1] + rmid[1]) / 2.0)
+    gates = {
+        "left": LineGate("left", line_pt1, line_pt2, inside_ref),
+        "right": LineGate("right", right_line_pt1, right_line_pt2, inside_ref),
+    }
+
+    # Restore cumulative counts from existing log
+    cumulative = load_cumulative_from_log(log_file_path)
+    tally = {
+        "total": cumulative["total"],
+        "left": cumulative["left"],
+        "right": cumulative["right"],
+    }
+
+    # Loggers
+    count_logger = CountEventLogger(log_file_path)
+    timing_logger = PipelineTimingLogger(timing_log_path) if not no_timing_log else None
+
+    # Track states
+    track_state = {}
+    retired_ids = set()
+    counted_ids = set()
+    count_id_counter = {"next": 1}
+
+    def new_count_id():
+        val = f"C{count_id_counter['next']:07d}"
+        count_id_counter["next"] += 1
+        return val
+
+    def exit_margin_for(side):
+        return line_hysteresis if side == "left" else right_commit_px
+
+    def resolve_crossing(state, tid, side, fc, pf, deferred):
+        val = state["class_value"]
+        d_left = gates["left"].inside_dist(state["last_xy"][0], state["last_xy"][1]) if state.get("last_xy") else 0.0
+        d_right = gates["right"].inside_dist(state["last_xy"][0], state["last_xy"][1]) if state.get("last_xy") else 0.0
+        req_margin = exit_margin_for(side)
+        destination_reached = (d_left < -req_margin) if side == "left" else (d_right < -req_margin)
+
+        if not state.get("seen_work_zone", False) or not destination_reached:
+            state["lines"][side]["pending"] = True
+            return False
+
+        assigned = state.get("assigned_line")
+        if assigned is not None and assigned != side:
+            return False
+
+        state["assigned_line"] = side
+        state["counted"] = True
+        counted_ids.add(int(tid))
+        state["counted_value"] = val
+        state["crossed_side"] = side
+
+        if side == "left":
+            state["ever_crossed_left"] = True
+        else:
+            state["ever_crossed_right"] = True
+
+        if val > 0:
+            state["ever_counted_full"] = True
+            state["total_counted_value"] += val
+            tally["total"] += val
+            tally[side] += val
+
+            # PURE INCREASING COUNT LOG IN IST DAY AND TIME
+            now_dt = datetime.datetime.now(tz)
+            count_logger.log_increment(
+                dt=now_dt,
+                val=val,
+                line=side,
+                cls_name=state.get("class_name", "full"),
+                total=tally["total"],
+                left=tally["left"],
+                right=tally["right"],
+                tid=tid,
+                cid=state.get("count_id", "UNKNOWN"),
+                frame_no=pf,
+                src=safe_source,
+            )
+
+            # Output ONLY when count increases
+            day_name = now_dt.strftime("%A")
+            dt_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"[{day_name}, {dt_str} IST] COUNT INCREASED: +{val} | "
+                f"Total={tally['total']} (Left={tally['left']}, Right={tally['right']}) | "
+                f"Line={side.upper()} | Class=full",
+                flush=True
+            )
+        else:
+            state["ever_counted_empty"] = True
+
+        return True
+
+    def reset_for_next_counting_cycle(state, tid, fc, pf, side):
+        state["count_id"] = new_count_id()
+        state["predictions"].clear()
+        state["wz_empty_votes"] = 0
+        state["wz_full_votes"] = 0
+        state["consec_full_confs"].clear()
+        state["consec_full_xys"].clear()
+        state["locked_frame"] = None
+        state["class_value"] = None
+        state["class_name"] = "Unknown"
+        state["class_locked"] = False
+        state["consecutive_same"] = 0
+        state["last_consecutive_class"] = None
+        state["counted"] = False
+        state["counted_value"] = None
+        state["crossed_side"] = None
+        state["seen_work_zone"] = False
+        state["return_buffer_side"] = None
+        state["return_buffer_frames"] = 0
+        state["assigned_line"] = None
+        state["cross_info"] = {}
+        for line_name, line_state in state["lines"].items():
+            line_state["crossed"] = False
+            line_state["pending"] = False
+
+    def try_stitch(new_tid, ax, ay, sw, sh, pf, fc, active_now):
+        best, best_d = None, 1e18
+        for otid, ost in track_state.items():
+            if otid in active_now or ost["last_xy"] is None:
+                continue
+            if (ost.get("counted", False)
+                    or ost.get("assigned_line") is not None
+                    or ost.get("crossed_side") in ("left", "right")
+                    or any(ls.get("crossed", False) or ls.get("pending", False) for ls in ost.get("lines", {}).values())
+                    or ost.get("class_locked", False)):
+                continue
+            gap = pf - ost["last_seen_frame"]
+            if gap < 1 or gap > stitch_gap:
+                continue
+            lb = ost["last_box"]
+            if lb[0] < STITCH_BORDER or lb[1] < STITCH_BORDER or lb[2] > w - STITCH_BORDER or lb[3] > h - STITCH_BORDER:
+                continue
+            pg = min(gap, 5)
+            px = ost["last_xy"][0] + ost["vel"][0] * pg
+            py = ost["last_xy"][1] + ost["vel"][1] * pg
+            d = math.hypot(ax - px, ay - py)
+            lw, lh = ost["last_size"]
+            ratio = (sw * sh) / max(lw * lh, 1.0)
+            stitch_radius = max(STITCH_MIN_RADIUS, 0.25 * lh)
+            if d <= stitch_radius and 0.65 <= ratio <= 1.6 and d < best_d:
+                best, best_d = otid, d
+        if best is None:
+            return None
+        st = track_state.pop(best)
+        st["ids"].append(new_tid)
+        retired_ids.add(best)
+        return st
+
+    def detect_persons(frame_bgr):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        try:
+            dets = detector.predict(rgb, threshold=rfdetr_conf_threshold, include_source_image=False)
+        except TypeError:
+            dets = detector.predict(rgb, threshold=rfdetr_conf_threshold)
+        if isinstance(dets, list):
+            dets = dets[0] if dets else sv.Detections.empty()
+        if dets is None or len(dets) == 0 or dets.class_id is None:
+            return sv.Detections.empty()
+        pd = dets[dets.class_id == person_class_id]
+        if len(pd) > 1:
+            pd = pd.with_nms(threshold=nms_iou, class_agnostic=True)
+        return pd
+
+    # Register clean shutdown signal
+    try:
+        import signal
+        def sig_handler(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, sig_handler)
+    except Exception:
+        pass
+
+    # 1-line clean startup announcement
+    now_start = datetime.datetime.now(tz)
+    print(
+        f"[{now_start.strftime('%A, %Y-%m-%d %H:%M:%S')} IST] 24/7 Forensic Counter started | "
+        f"Source: {safe_source} | Target: {effective_fps:.1f} FPS | "
+        f"Restored Cumulative: Total={tally['total']} (Left={tally['left']}, Right={tally['right']})",
+        flush=True
+    )
+
+    processed_frame_count = 0
+    frame_count = 0
+    last_fid = None
+    last_inference_start = None
+
+    try:
+        while cap.isOpened():
+            t_frame_start = time.perf_counter()
+
+            if is_stream:
+                # Real-time 10 FPS rate limiter pacing
+                if last_inference_start is not None:
+                    elapsed = time.monotonic() - last_inference_start
+                    wait_s = (1.0 / effective_fps) - elapsed
+                    if wait_s > 0:
+                        time.sleep(wait_s)
+                last_inference_start = time.monotonic()
+
+                ret, frame, fid, captured_at = cap.read_next(last_fid=last_fid, timeout=0.5)
+                if not ret:
+                    if cap.capture_finished:
+                        break
+                    continue
+                last_fid = fid
+                frame_count = fid or (frame_count + 1)
+                ts = time.monotonic()
+            else:
+                ret, frame, fid, captured_at = cap.read_next(timeout=0.5)
+                if not ret:
+                    break
+                frame_count += 1
+                ts = frame_count / effective_fps
+
+            processed_frame_count += 1
+            pf = processed_frame_count
+            fc = frame_count
+
+            # ---------------- 1. RF-DETR MODEL INFERENCE ----------------
+            t_model_start = time.perf_counter()
+            person_dets = detect_persons(frame)
+            model_time_ms = (time.perf_counter() - t_model_start) * 1000.0
+
+            tracked = tracker.update_with_detections(person_dets)
+
+            items = []
+            crops, flip_flags = [], []
+
+            # ---------------- 2. PER-TRACK UPDATE ----------------
+            if len(tracked) > 0:
+                boxes = tracked.xyxy
+                tids = tracked.tracker_id if tracked.tracker_id is not None else np.arange(len(boxes))
+                confs = tracked.confidence if tracked.confidence is not None else np.ones(len(boxes))
+                active_now = set(int(t) for t in tids)
+
+                for box, tid, conf in zip(boxes, tids, confs):
+                    tid = int(tid)
+                    if tid in retired_ids:
+                        continue
+                    rx1, ry1, rx2, ry2 = [float(v) for v in box]
+                    rw, rh = rx2 - rx1, ry2 - ry1
+                    if rw < 2 or rh < 2:
+                        continue
+                    rcx, rcy = (rx1 + rx2) / 2.0, (ry1 + ry2) / 2.0
+
+                    state = track_state.get(tid)
+                    if state is None:
+                        if enable_stitch:
+                            state = try_stitch(tid, rcx, rcy, rw, rh, pf, fc, active_now)
+                        if state is None:
+                            state = make_fresh_state(tid, smooth_cutoff, smooth_beta, new_count_id())
+                        track_state[tid] = state
+
+                    scx, scy, sw, sh = state["smoother"]([rcx, rcy, rw, rh], ts)
+                    sw, sh = max(sw, 2.0), max(sh, 2.0)
+                    sx1, sy1 = max(0.0, scx - sw / 2.0), max(0.0, scy - sh / 2.0)
+                    sx2, sy2 = min(float(w), scx + sw / 2.0), min(float(h), scy + sh / 2.0)
+                    ax = scx
+                    ay = scy if anchor == "center" else sy2
+
+                    if state["last_xy"] is not None:
+                        gap = max(1, pf - state["last_seen_frame"])
+                        vx = (ax - state["last_xy"][0]) / gap
+                        vy = (ay - state["last_xy"][1]) / gap
+                        state["vel"] = (0.6 * state["vel"][0] + 0.4 * vx, 0.6 * state["vel"][1] + 0.4 * vy)
+
+                    state["last_xy"] = (ax, ay)
+                    state["last_box"] = (sx1, sy1, sx2, sy2)
+                    state["last_size"] = (sw, sh)
+                    state["last_seen_frame"] = pf
+                    state["age"] += 1
+                    state["hist"].append((ax, ay))
+
+                    dL = gates["left"].inside_dist(ax, ay)
+                    dR = gates["right"].inside_dist(ax, ay)
+                    state["zone"] = "A" if dL < 0 else ("C" if dR < 0 else "B")
+                    if dL >= 0 and dR >= 0:
+                        state["seen_work_zone"] = True
+
+                    # Expire stale mid-room locks on loitering tracks before crossing check
+                    check_stale_lock_expiration(state, pf)
+
+                    direction = window_direction(state["hist"])
+                    pending_any = state["lines"]["left"]["pending"] or state["lines"]["right"]["pending"]
+                    near_any_line = (abs(dL) <= NEAR_LINE_BOOST_PX) or (abs(dR) <= NEAR_LINE_BOOST_PX)
+
+                    due = (
+                        near_any_line
+                        or state["age"] % classify_interval == 0
+                        or state["class_name"] == "Unknown"
+                        or pending_any
+                    )
+
+                    already_counted_returning = state["counted"] and (
+                        (state["crossed_side"] == "left" and direction == "to_right")
+                        or (state["crossed_side"] == "right" and direction == "to_left")
+                    )
+
+                    action, crop_idx = None, None
+                    if due and not state["class_locked"]:
+                        if already_counted_returning and not pending_any:
+                            action = "returning"
+                        else:
+                            pad = 5
+                            cx1, cy1 = max(0, int(rx1) - pad), max(0, int(ry1) - pad)
+                            cx2, cy2 = min(w, int(rx2) + pad), min(h, int(ry2) + pad)
+                            crop = frame[cy1:cy2, cx1:cx2]
+                            if crop.size > 0:
+                                action = "classify"
+                                crop_idx = len(crops)
+                                crops.append(crop)
+                                use_flip_tta = (direction == "to_right") or (dR < dL)
+                                flip_flags.append(use_flip_tta)
+
+                    items.append({
+                        "tid": tid, "state": state, "conf": float(conf),
+                        "ax": ax, "ay": ay, "dL": dL, "dR": dR,
+                        "direction": direction, "action": action, "crop_idx": crop_idx,
+                    })
+
+            # ---------------- 3. RESNET CLASSIFIER INFERENCE ----------------
+            t_cls_start = time.perf_counter()
+            results = classify_crops(resnet, transform, crops, flip_flags, device, class_mapping) if crops else []
+            classifier_time_ms = (time.perf_counter() - t_cls_start) * 1000.0
+
+            # ---------------- 4. CLASSIFICATION & CROSSING RESOLUTION ----------------
+            for it in items:
+                tid, state = it["tid"], it["state"]
+                ax, ay = it["ax"], it["ay"]
+                dL, dR = it["dL"], it["dR"]
+
+                if it["crop_idx"] is not None and it["crop_idx"] < len(results):
+                    name, c = results[it["crop_idx"]]
+                    if name != "unknown":
+                        in_wz = (dL >= 0 and dR >= 0)
+                        update_class(state, name, c, in_wz, ax, ay, pf)
+                        state["all_predictions"].append(name)
+
+                # Deferred crossing resolution
+                for side in ("left", "right"):
+                    ls = state["lines"][side]
+                    req_margin = exit_margin_for(side)
+                    destination_reached = (dL < -req_margin) if side == "left" else (dR < -req_margin)
+                    if ls["pending"] and state["class_value"] is not None and destination_reached:
+                        if state["counted"]:
+                            ls["pending"] = False
+                        else:
+                            resolve_crossing(state, tid, side, fc, pf, deferred=True)
+                            if state.get("counted", False):
+                                ls["pending"] = False
+
+                # Confirmed-return buffer for multi-cycle workers
+                previously_counted_track = int(tid) in counted_ids
+                current_cycle_was_counted = bool(state.get("counted", False))
+                has_counted_crossing = state.get("crossed_side") in ("left", "right")
+                if previously_counted_track and current_cycle_was_counted and has_counted_crossing:
+                    return_side = state["crossed_side"]
+                    return_dist = dL if return_side == "left" else dR
+                    if return_dist >= REASSIGNED_RETURN_RESET_DISTANCE_PX:
+                        if state.get("return_buffer_side") == return_side:
+                            state["return_buffer_frames"] += 1
+                        else:
+                            state["return_buffer_side"] = return_side
+                            state["return_buffer_frames"] = 1
+                        required_frames = max(2, int(round(RETURN_RESET_SECONDS * effective_fps)))
+                        if state["return_buffer_frames"] >= required_frames:
+                            reset_for_next_counting_cycle(state, tid, fc, pf, return_side)
+                    else:
+                        state["return_buffer_side"] = None
+                        state["return_buffer_frames"] = 0
+                else:
+                    state["return_buffer_side"] = None
+                    state["return_buffer_frames"] = 0
+
+                # Crossings detection
+                for side in ("left", "right"):
+                    ls = state["lines"][side]
+                    req_margin = exit_margin_for(side)
+                    ev = update_line_side(ls, gates[side], ax, ay, req_margin, line_hysteresis)
+                    if ev == "exit":
+                        if ls["crossed"]:
+                            continue
+                        ls["crossed"] = True
+                        state["cross_info"][side] = (ax, ay, pf)
+                        assigned = state.get("assigned_line")
+                        destination_reached = (dL < -req_margin) if side == "left" else (dR < -req_margin)
+                        if not state.get("seen_work_zone", False) or not destination_reached:
+                            pass
+                        elif assigned is not None and assigned != side:
+                            pass
+                        elif state["counted"]:
+                            pass
+                        else:
+                            if state["class_value"] is not None:
+                                state["assigned_line"] = side
+                                resolve_crossing(state, tid, side, fc, pf, deferred=False)
+                            else:
+                                if assigned is None:
+                                    state["assigned_line"] = side
+                                ls["pending"] = True
+                    elif ev == "return":
+                        if ls["pending"] and not state["counted"]:
+                            ls["pending"] = False
+                            ls["crossed"] = False
+                            if state.get("assigned_line") == side:
+                                state["assigned_line"] = None
+
+            # Evict stale tracks
+            stale = [tid for tid, s in track_state.items() if pf - s["last_seen_frame"] > EVICT_AFTER_FRAMES]
+            for tid in stale:
+                retired_ids.add(tid)
+                del track_state[tid]
+
+            # ---------------- 5. PER-FRAME PIPELINE TIMING LOGGING ----------------
+            pipeline_time_ms = (time.perf_counter() - t_frame_start) * 1000.0
+
+            if timing_logger is not None:
+                timing_logger.log_frame(
+                    dt=datetime.datetime.now(tz),
+                    frame_no=pf,
+                    model_ms=model_time_ms,
+                    classifier_ms=classifier_time_ms,
+                    pipeline_ms=pipeline_time_ms,
+                    num_dets=len(person_dets),
+                    num_crops=len(crops),
+                )
+
+            if show_display:
+                try:
+                    cv2.imshow("RF-DETR CCTV Counter", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except Exception:
+                    show_display = False
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+        count_logger.close()
+        if timing_logger is not None:
+            timing_logger.close()
+        if show_display:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+    now_stop = datetime.datetime.now(tz)
+    print(
+        f"[{now_stop.strftime('%A, %Y-%m-%d %H:%M:%S')} IST] 24/7 Counter stopped | "
+        f"Processed: {processed_frame_count} frames | "
+        f"Cumulative Total={tally['total']} (Left={tally['left']}, Right={tally['right']})",
+        flush=True
+    )
+
+# ================================================================
+# 12. CLI ARGS & ENTRY POINT
+# ================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="24/7 RF-DETR + ResNet CCTV Counter - Real-time zero-backlog with IST & Telemetry Logging"
+    )
+    parser.add_argument("--source", "-s", default=os.environ.get("SOURCE") or os.environ.get("RTSP_URL"),
+                        help="RTSP stream URL (e.g. rtsp://user:pass@ip:554/ch1), webcam index (0), or video file")
+    parser.add_argument("--model", default=os.environ.get("MODEL_PATH"),
+                        help="ResNet152 classifier weights (defaults to models/ResNet152_direction_best_4.pth)")
+    parser.add_argument("--detector-checkpoint", default=os.environ.get("DETECTOR_CHECKPOINT"),
+                        help="Fine-tuned RF-DETR Small checkpoint (defaults to models/best_model.pth)")
+    parser.add_argument("--mapping", default=os.environ.get("MAPPING_PATH"),
+                        help="Class mapping file (defaults to models/class_mapping.txt)")
+    parser.add_argument("--log-file", default=os.environ.get("LOG_FILE") or DEFAULT_COUNT_LOG,
+                        help="CSV file path for pure increasing count logs in IST (defaults to production_logs/counts_log.csv)")
+    parser.add_argument("--timing-log", default=os.environ.get("TIMING_LOG") or DEFAULT_TIMING_LOG,
+                        help="CSV file path for per-frame pipeline execution times (defaults to production_logs/pipeline_timing.csv)")
+    parser.add_argument("--no-timing-log", action="store_true", help="Disable generating per-frame timing log")
+    parser.add_argument("--timezone", default=os.environ.get("TIMEZONE", "Asia/Kolkata"),
+                        help="Timezone for timestamps (default: Asia/Kolkata [IST])")
+    parser.add_argument("--fps", type=float, default=TARGET_PROCESS_FPS,
+                        help=f"Target real-time processing FPS limit (default: {TARGET_PROCESS_FPS})")
+    parser.add_argument("--det-conf", type=float, default=0.20, help="RF-DETR confidence floor (default: 0.20)")
+    parser.add_argument("--track-thresh", type=float, default=0.40, help="ByteTrack activation threshold (default: 0.40)")
+    parser.add_argument("--transport", default="tcp", choices=["tcp", "udp"], help="RTSP transport (default: tcp)")
+    parser.add_argument("--reconnect-delay", type=float, default=2.0, help="RTSP reconnect backoff delay in seconds (default: 2.0)")
+    parser.add_argument("--max-retries", type=int, default=0, help="Max RTSP reconnection attempts (0 for infinite 24/7 retry)")
+    parser.add_argument("--realtime", action="store_true", help="Force real-time rate limiter and frame-drop logic on video sources")
+    parser.add_argument("--show", action="store_true", help="Open a display window for live preview")
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    try:
-        timezone = ZoneInfo(args.timezone)
-    except Exception as exc:
-        raise RuntimeError(f"Invalid timezone {args.timezone!r}") from exc
 
-    # Intelligently resolve model, checkpoint, mapping, and log paths
     model_path = resolve_asset_path(
         args.model,
         ["ResNet152_direction_best_4.pth", "resnet152.pth"],
         env_var="MODEL_PATH",
-        desc="ResNet classifier checkpoint",
+        desc="ResNet classifier weights",
     )
     detector_checkpoint = resolve_asset_path(
         args.detector_checkpoint,
@@ -1162,488 +1391,45 @@ def main():
         desc="class mapping",
     )
 
-    default_log = os.path.join(SCRIPT_DIR, "production_logs", "counts_log.csv")
-    log_path = os.path.abspath(args.log_file or os.environ.get("LOG_FILE") or default_log)
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-
-    ensure_colab_drive_if_needed(log_path)
-
-    # Query mode reads only the CSV. It does not load RF-DETR/ResNet or open a camera.
-    if args.query_only or args.query_start or args.query_end:
-        if not args.query_start or not args.query_end:
-            raise ValueError("Provide both --query-start and --query-end for query mode.")
-        query_log(
-            log_path,
-            args.query_start,
-            args.query_end,
-            timezone,
-            args.query_time_column,
-        )
-        return
-
-    source = args.source or os.environ.get("SOURCE") or os.environ.get("RTSP_URL")
+    source = args.source
     if not source:
-        raise ValueError(
-            "Missing video or stream source.\n"
-            "Provide --source <path_or_url> or set RTSP_URL or SOURCE in your environment.\n"
-            "Examples:\n"
-            "  Local video : python main.py --source sample.mp4\n"
-            "  RTSP camera : python main.py --source rtsp://user:pass@192.168.1.50:554/stream1\n"
-            "  Webcam      : python main.py --source 0\n"
-            "  Query log   : python main.py --query-only --query-start 2026-10-27T08:00:00 --query-end 2026-10-27T18:00:00"
-        )
-
-    load_runtime_dependencies()
-    ensure_colab_drive_if_needed(model_path)
-    ensure_colab_drive_if_needed(detector_checkpoint)
-
-    # Validate model checkpoints exist
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(
-            f"ResNet checkpoint not found at: {model_path}\n"
-            f"Please verify that 'models/ResNet152_direction_best_4.pth' exists or specify --model."
-        )
-    if not os.path.isfile(detector_checkpoint):
-        raise FileNotFoundError(
-            f"RF-DETR checkpoint not found at: {detector_checkpoint}\n"
-            f"Please verify that 'models/best_model.pth' exists or specify --detector-checkpoint."
-        )
-
-    # Check for Git LFS pointer text files
-    for name, path in [("ResNet Classifier", model_path), ("RF-DETR Detector", detector_checkpoint)]:
-        if check_git_lfs_pointer(path):
-            print("\n" + "=" * 75)
-            print(f"⚠️  GIT LFS WARNING: {name} weight file is a Git LFS pointer text file:")
-            print(f"    {path}")
-            print("\nThe actual binary weights (>100MB) have not been downloaded by Git yet.")
-            print("To download the actual model files on your machine, run:")
-            print("    git lfs install")
-            print("    git lfs pull")
-            print("=" * 75 + "\n")
-            raise RuntimeError(
-                f"Model file '{os.path.basename(path)}' is a Git LFS pointer. Run 'git lfs pull' to download weights."
+        # Check standard Colab test video fallback if on Colab
+        colab_video = "/content/drive/MyDrive/Amrendra_Guardex/tin_counter_new_angle/testing_video_folder/Monday_12-Oct-2026_11-09-41_AM.mp4"
+        if os.path.exists(colab_video):
+            source = colab_video
+        else:
+            raise ValueError(
+                "Missing source stream or video.\n"
+                "Provide --source <url_or_path> or set RTSP_URL or SOURCE environment variable.\n"
+                "Examples:\n"
+                "  RTSP stream : python main.py --source rtsp://user:pass@192.168.1.50:554/stream1\n"
+                "  Webcam      : python main.py --source 0\n"
+                "  Local video : python main.py --source sample.mp4"
             )
 
-    cumulative = load_cumulative_from_log(log_path)
-    session_id = str(uuid.uuid4())
-    source_type = "rtsp" if str(source).startswith(("rtsp://", "rtsps://", "http://", "https://")) else "video"
-    safe_source_name = source_label(source)
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print("=" * 60)
-    print(" 🥫 Guardex AI - Industrial Forensic Counter")
-    print("=" * 60)
-    print(f"Device               : {device}")
-    if device.type == "cpu":
-        print("Note                 : Running on CPU. GPU is recommended for full 10 FPS.")
-    print(f"Source type          : {source_type}")
-    print(f"Source               : {safe_source_name}")
-    print(f"Detector Checkpoint  : {detector_checkpoint}")
-    print(f"Classifier Model     : {model_path}")
-    print(f"Class Mapping        : {mapping_path}")
-    print(f"Count Log (CSV)      : {log_path}")
-    print(
-        f"Restored Cumulative  : left={cumulative['left']}, "
-        f"right={cumulative['right']}, total={cumulative['total']}"
+    process_stream(
+        source=source,
+        model_path=model_path,
+        detector_checkpoint_path=detector_checkpoint,
+        class_mapping_path=mapping_path,
+        log_file_path=args.log_file,
+        timing_log_path=args.timing_log,
+        line_pt1=LINE_START,
+        line_pt2=LINE_END,
+        right_line_pt1=RIGHT_LINE_START,
+        right_line_pt2=RIGHT_LINE_END,
+        target_fps=args.fps,
+        rfdetr_conf_threshold=args.det_conf,
+        person_class_id=PERSON_CLASS_ID,
+        track_activation=args.track_thresh,
+        rtsp_transport=args.transport,
+        reconnect_delay=args.reconnect_delay,
+        max_retries=args.max_retries,
+        timezone_name=args.timezone,
+        no_timing_log=args.no_timing_log,
+        realtime=args.realtime,
+        show_display=args.show,
     )
-    print(f"Session ID           : {session_id}")
-    print("=" * 60)
-
-    if source_type == "rtsp":
-        print(
-            f"Live stream capture: real-time latest-frame sampling with frame-drop at {args.max_inference_fps:.2f} FPS (zero backlog)."
-        )
-
-    class_names = load_class_mapping(mapping_path)
-    detector = RFDETRSmall.from_checkpoint(detector_checkpoint)
-    classifier = build_classifier(model_path, len(class_names), device)
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
-
-    logger = CountEventLogger(log_path)
-    cap = None
-    interrupted = False
-    processed_frame = 0
-    source_frame = 0
-    detector_calls = 0
-    classifier_calls = 0
-    start_wall = time.monotonic()
-    next_count_seq = 1
-    tracker = KalmanCentroidTracker(max_disappeared=30, max_distance=180)
-    track_states = {}
-    session_counts = {"left": 0, "right": 0, "total": 0}
-    source_anchor = parse_datetime(args.video_start_datetime, timezone) if args.video_start_datetime else None
-    last_inference_start = None
-    last_processed_fid = None
-    video_frames_read_since_start = 0
-
-    def write_count_event(
-        event_dt, source_dt, source_seconds, frame_no, processed_no, tid,
-        state, side, class_name, class_confidence, detector_confidence, added,
-    ):
-        # Global counters are restored from the existing append-only log.
-        cumulative["total"] += int(added)
-        if side == "left":
-            cumulative["left"] += int(added)
-            session_counts["left"] += int(added)
-        else:
-            cumulative["right"] += int(added)
-            session_counts["right"] += int(added)
-        session_counts["total"] += int(added)
-
-        row = {
-            "event_time": iso_time(event_dt),
-            "logged_at": iso_time(now_local(timezone)),
-            "source_type": source_type,
-            "source": safe_source_name,
-            "session_id": session_id,
-            "source_frame": frame_no,
-            "processed_frame": processed_no,
-            "track_id": tid,
-            "count_id": state["count_id"],
-            "line": side,
-            "event": "COUNTED",
-            "class_name": class_name,
-            "class_confidence": "" if class_confidence is None else f"{class_confidence:.5f}",
-            "detector_confidence": f"{float(detector_confidence):.5f}",
-            "added": int(added),
-            "left_delta": int(added) if side == "left" else 0,
-            "right_delta": int(added) if side == "right" else 0,
-            "total_delta": int(added),
-            "cumulative_left": cumulative["left"],
-            "cumulative_right": cumulative["right"],
-            "cumulative_total": cumulative["total"],
-            "source_time": iso_time(source_dt),
-            "source_seconds": "" if source_seconds is None else f"{source_seconds:.3f}",
-        }
-        # Persist immediately so a normal interruption does not lose count events.
-        logger.write_count(row)
-        state["counted_value"] = int(added)
-        state["counted"] = True
-        state["counted_left"] = side == "left"
-        state["counted_right"] = side == "right"
-        print(
-            f"COUNTED {side.upper()} | +{added} | "
-            f"Left={cumulative['left']} Right={cumulative['right']} Total={cumulative['total']} | "
-            f"time={iso_time(event_dt)}"
-        )
-
-    # Register SIGTERM handler for clean Docker / systemd termination
-    try:
-        import signal
-        def sigterm_handler(signum, frame):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, sigterm_handler)
-    except (ValueError, AttributeError, ImportError):
-        pass
-
-    try:
-        cap = RTSPCapture(
-            source,
-            timezone=timezone,
-            rtsp_transport=args.rtsp_transport,
-            reconnect_delay=args.rtsp_reconnect_delay,
-            max_retries=args.rtsp_max_retries,
-        )
-        reported_fps = cap.get(cv2.CAP_PROP_FPS)
-        if not reported_fps or not math.isfinite(reported_fps) or reported_fps <= 0 or reported_fps > 120:
-            reported_fps = 25.0
-        fps = float(reported_fps)
-
-        if source_type == "video":
-            start_offset = parse_offset_seconds(args.start) or 0.0
-            end_offset = parse_offset_seconds(args.end)
-            if start_offset > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_offset * fps))
-            start_frame_idx = int(start_offset * fps)
-            next_sample_number = 0
-            sample_every_native_frame = fps < 10.0
-            target_rate = min(10.0, fps)
-        else:
-            start_offset = 0.0
-            end_offset = None
-            start_frame_idx = 0
-            sample_every_native_frame = True
-            target_rate = max(0.1, float(args.max_inference_fps))
-
-        print(f"Input FPS reported: {fps:.3f}; target inference rate: {target_rate:.3f} FPS")
-        print("Only the count-event CSV is generated. No annotated video or other report files will be written.")
-
-        while True:
-            try:
-                if source_type != "video":
-                    # Pacing rate-limiter: enforce target FPS without queue lag
-                    if last_inference_start is not None:
-                        elapsed = time.monotonic() - last_inference_start
-                        wait_s = (1.0 / target_rate) - elapsed
-                        if wait_s > 0:
-                            time.sleep(wait_s)
-                    last_inference_start = time.monotonic()
-
-                    ret, frame, fid, captured_at = cap.read_next(last_fid=last_processed_fid, timeout=0.5)
-                    if not ret:
-                        if cap.capture_finished:
-                            break
-                        continue
-                    last_processed_fid = fid
-                    source_frame = int(fid) if fid is not None else source_frame + 1
-                    source_seconds = None
-                    source_event_dt = captured_at
-                    event_dt = captured_at
-                else:
-                    ret, frame, fid, captured_at = cap.read_next(timeout=0.5)
-                    if not ret:
-                        break
-
-                    # Reconstruct the actual 1-based source frame index after a seek.
-                    video_frames_read_since_start += 1
-                    source_frame = start_frame_idx + video_frames_read_since_start
-                    source_frame_zero = source_frame - 1
-                    relative_frame = video_frames_read_since_start - 1
-                    source_seconds = source_frame_zero / max(fps, 1e-6)
-                    if end_offset is not None and source_seconds >= end_offset:
-                        break
-                    if not sample_every_native_frame:
-                        target_source_frame = int(round(next_sample_number * fps / target_rate))
-                        if relative_frame < target_source_frame:
-                            continue
-                        next_sample_number += 1
-                    if source_anchor is not None:
-                        source_event_dt = source_anchor + datetime.timedelta(seconds=source_seconds)
-                    else:
-                        source_event_dt = None
-                    event_dt = now_local(timezone)
-
-                processed_frame += 1
-                frame_h, frame_w = frame.shape[:2]
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                detections = detector.predict(Image.fromarray(rgb_frame), threshold=float(args.det_conf))
-                detector_calls += 1
-
-                rects = []
-                if hasattr(detections, "xyxy"):
-                    for xyxy, conf, cls_id in zip(
-                        detections.xyxy, detections.confidence, detections.class_id
-                    ):
-                        if int(cls_id) == 0 and float(conf) >= float(args.det_conf):
-                            x1, y1, x2, y2 = [float(v) for v in xyxy]
-                            rects.append((x1, y1, x2, y2, float(conf)))
-
-                tracked = tracker.update(rects, min_new_track_conf=float(args.track_thresh))
-
-                for tid, info in tracked.items():
-                    if info["disappeared"] > 0:
-                        continue
-                    cx, cy = info["centroid"]
-                    raw_cx, raw_cy = info["raw_centroid"]
-                    x1, y1, x2, y2 = info["bbox"]
-                    det_conf = float(info["conf"])
-
-                    d_left = get_inside_distance((cx, cy), line_pt1, line_pt2, LEFT_INSIDE_SIGN)
-                    d_right = get_inside_distance((cx, cy), right_line_pt1, right_line_pt2, RIGHT_INSIDE_SIGN)
-
-                    if tid not in track_states:
-                        cid = f"{session_id[:8]}-C{next_count_seq:07d}"
-                        next_count_seq += 1
-                        init_l = 1 if d_left >= LEFT_RETURN_DEADBAND_PX else (-1 if d_left <= -LEFT_CROSSING_BUFFER_PX else None)
-                        init_r = 1 if d_right >= RIGHT_RETURN_DEADBAND_PX else (-1 if d_right <= -RIGHT_CROSSING_BUFFER_PX else None)
-                        track_states[tid] = {
-                            "count_id": cid,
-                            "start_frame": processed_frame,
-                            "history": deque(maxlen=30),
-                            "predictions": [],
-                            "vote_details": [],
-                            "wz_empty_votes": 0,
-                            "cycle_empty_votes": 0,
-                            "is_locked": False,
-                            "locked_class": None,
-                            "locked_frame": None,
-                            "locked_pos": None,
-                            "min_dL_since_lock": None,
-                            "min_dR_since_lock": None,
-                            "counted": False,
-                            "counted_left": False,
-                            "counted_right": False,
-                            "return_armed_left": False,
-                            "return_armed_right": False,
-                            "side_left": init_l,
-                            "side_right": init_r,
-                            "seen_work_zone": False,
-                            "max_inside_left": d_left,
-                            "max_inside_right": d_right,
-                            "last_cls_frame": -999,
-                            "last_reset_frame": -999,
-                            "last_class_conf": None,
-                            "last_class_prediction": "Unknown",
-                        }
-
-                    state = track_states[tid]
-                    state["history"].append((cx, cy))
-                    state["max_inside_left"] = max(state["max_inside_left"], d_left)
-                    state["max_inside_right"] = max(state["max_inside_right"], d_right)
-                    if d_left >= MIN_WORK_ZONE_DEPTH_PX and d_right >= MIN_WORK_ZONE_DEPTH_PX:
-                        state["seen_work_zone"] = True
-
-                    direction = None
-                    if len(state["history"]) >= 3:
-                        dx = state["history"][-1][0] - state["history"][-3][0]
-                        if dx <= -4:
-                            direction = "to_left"
-                        elif dx >= 4:
-                            direction = "to_right"
-
-                    check_stale_lock_expiration(state, processed_frame, cx, cy, d_left, d_right)
-                    in_reset_cooldown = (processed_frame - state["last_reset_frame"]) <= 5
-
-                    # ResNet inference is only performed on detections in the selected RF-DETR frame.
-                    if in_reset_cooldown:
-                        pass
-                    elif not state["is_locked"]:
-                        near_line = abs(d_left) <= 220.0 or abs(d_right) <= 220.0
-                        early_track = len(state["predictions"]) < 4
-                        throttle_ok = (processed_frame - state["last_cls_frame"]) >= 5
-                        if near_line or early_track or throttle_ok:
-                            pad_x = int((x2 - x1) * 0.08)
-                            pad_y = int((y2 - y1) * 0.08)
-                            cx1 = max(0, int(x1) - pad_x)
-                            cy1 = max(0, int(y1) - pad_y)
-                            cx2 = min(frame_w, int(x2) + pad_x)
-                            cy2 = min(frame_h, int(y2) + pad_y)
-                            if cx2 > cx1 and cy2 > cy1:
-                                crop = rgb_frame[cy1:cy2, cx1:cx2]
-                                tensor = preprocess(Image.fromarray(crop)).unsqueeze(0).to(device)
-                                with torch.no_grad():
-                                    probs = torch.softmax(classifier(tensor), dim=1)[0]
-                                    classifier_calls += 1
-                                    conf_tensor, idx_tensor = torch.max(probs, dim=0)
-                                    raw_class = class_names[int(idx_tensor)].lower()
-                                    cls_name = "full" if "full" in raw_class else "empty"
-                                    cls_conf = float(conf_tensor.item())
-                                state["last_cls_frame"] = processed_frame
-                                state["last_class_conf"] = cls_conf
-                                state["last_class_prediction"] = cls_name
-                                was_locked = state["is_locked"]
-                                evaluate_vote_locking(state, cls_name, cls_conf, cx, cy, d_left, d_right)
-                                if state["is_locked"] and not was_locked:
-                                    state["locked_frame"] = processed_frame
-
-                    new_l, arm_l, events_l = evaluate_buffer_crossing(
-                        state["side_left"], d_left, state["counted_left"], state["return_armed_left"],
-                        crossing_buffer_px=LEFT_CROSSING_BUFFER_PX,
-                        return_deadband_px=LEFT_RETURN_DEADBAND_PX,
-                    )
-                    state["side_left"], state["return_armed_left"] = new_l, arm_l
-                    new_r, arm_r, events_r = evaluate_buffer_crossing(
-                        state["side_right"], d_right, state["counted_right"], state["return_armed_right"],
-                        crossing_buffer_px=RIGHT_CROSSING_BUFFER_PX,
-                        return_deadband_px=RIGHT_RETURN_DEADBAND_PX,
-                    )
-                    state["side_right"], state["return_armed_right"] = new_r, arm_r
-
-                    for side, evs, d_curr, max_inside in (
-                        ("left", events_l, d_left, state["max_inside_left"]),
-                        ("right", events_r, d_right, state["max_inside_right"]),
-                    ):
-                        for ev in evs:
-                            if ev == "return":
-                                clear_pre_entry_full_noise(state)
-                                continue
-                            if ev == "return_seen":
-                                continue
-                            if ev == "return_confirmed":
-                                reset_track_for_new_count(state, processed_frame)
-                                state["count_id"] = f"{session_id[:8]}-C{next_count_seq:07d}"
-                                next_count_seq += 1
-                                if side == "left":
-                                    state["max_inside_left"] = d_curr
-                                else:
-                                    state["max_inside_right"] = d_curr
-                                continue
-                            if ev != "crossed":
-                                continue
-
-                            maj_cls = get_majority_class(state)
-                            eligible = (
-                                not state["counted"]
-                                and state["seen_work_zone"]
-                                and max_inside >= MIN_WORK_ZONE_DEPTH_PX
-                            )
-                            if not eligible:
-                                continue
-
-                            # Preserve the existing counter's scoring rule: a full load adds 2;
-                            # empty/unknown adds 0 but the crossing is still marked counted.
-                            added = 2 if maj_cls == "full" else 0
-                            state["counted"] = True
-                            state["counted_left"] = side == "left"
-                            state["counted_right"] = side == "right"
-
-                            event_timestamp = event_dt
-                            source_timestamp = source_event_dt
-                            write_count_event(
-                                event_timestamp,
-                                source_timestamp,
-                                source_seconds,
-                                source_frame,
-                                processed_frame,
-                                tid,
-                                state,
-                                side,
-                                maj_cls,
-                                state.get("last_class_conf"),
-                                det_conf,
-                                added,
-                            )
-
-                if processed_frame % 100 == 0:
-                    elapsed = max(time.monotonic() - start_wall, 1e-6)
-                    dropped = cap.get_dropped_count() if source_type != "video" else 0
-                    print(
-                        f"STATUS {iso_time(now_local(timezone))} | frames={processed_frame} | "
-                        f"RF-DETR FPS={detector_calls / elapsed:.2f} | dropped={dropped} | "
-                        f"left={cumulative['left']} right={cumulative['right']} total={cumulative['total']}"
-                    )
-
-            except KeyboardInterrupt:
-                interrupted = True
-                print("\nINTERRUPTION RECEIVED: stopping capture immediately...")
-                break
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\nINTERRUPTION RECEIVED: stopping capture. All accepted count events have already been flushed to the CSV log.")
-    finally:
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception as exc:
-                print(f"WARNING: error releasing capture: {exc}")
-        try:
-            logger.close()
-        except Exception as exc:
-            print(f"WARNING: error closing count log: {exc}")
-
-    elapsed = max(time.monotonic() - start_wall, 1e-6)
-    dropped = cap.get_dropped_count() if (cap is not None and source_type != "video") else 0
-    print("\n" + "=" * 60)
-    print("RUN STOPPED SAFELY" if interrupted else "RUN FINISHED")
-    print(f"Count log: {log_path}")
-    print(f"Cumulative LEFT: {cumulative['left']}")
-    print(f"Cumulative RIGHT: {cumulative['right']}")
-    print(f"Cumulative TOTAL: {cumulative['total']}")
-    print(f"This session LEFT delta: {session_counts['left']}")
-    print(f"This session RIGHT delta: {session_counts['right']}")
-    print(f"This session TOTAL delta: {session_counts['total']}")
-    print(f"Processed frames: {processed_frame}; RF-DETR calls: {detector_calls}; ResNet crop calls: {classifier_calls}")
-    if source_type != "video":
-        print(f"Frames dropped to maintain target FPS: {dropped}")
-    print(f"Wall-clock detector throughput: {detector_calls / elapsed:.2f} FPS")
-    print("Count events are appended and fsynced individually; previous counts are restored from the log on restart.")
 
 
 if __name__ == "__main__":

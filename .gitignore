@@ -15,6 +15,7 @@ temp_*
 
 # Log files and telemetry from runs
 production_logs/*.csv
+production_logs/*.log
 !production_logs/.gitkeep
 *_video.mp4
 *_summary.csv
